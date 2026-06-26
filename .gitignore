@@ -142,4 +142,6 @@ cython_debug/
 *.txt
 *-captures.txt
 *.jsonl
+*.pfx
+loot/
 data/known_clients.json
