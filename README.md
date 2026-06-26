@@ -1,4 +1,4 @@
-# PyWSUS
+# PyWSUS-Relay
 
 Rogue WSUS-over-HTTP server that keeps Windows Update Agent (WUA) talking while serving controlled WSUS metadata and a Microsoft-signed payload.
 
