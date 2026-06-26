@@ -136,4 +136,10 @@ dmypy.json
 
 # Cython debug symbols
 cython_debug/
+
+# pyWSUS runtime artifacts
+*.exe
+*.txt
+*-captures.txt
+*.jsonl
 data/known_clients.json
